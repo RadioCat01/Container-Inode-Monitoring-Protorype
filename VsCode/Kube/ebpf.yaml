@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebpf-tracer
+  namespace: default
+  labels:
+    app: ebpf-tracer
+spec:
+  selector:
+    matchLabels:
+      app: ebpf-tracer
+  template:
+    metadata:
+      labels:
+        app: ebpf-tracer
+    spec:
+      serviceAccountName: ebpf-tracer-sa
+      hostPID: true  # Grants the pod access to the host’s process ID namespace
+      containers:
+      - name: tracer
+        image: radiocat2000/ebpf:latest  
+        imagePullPolicy: IfNotPresent  
+        securityContext:
+          privileged: true  # Runs the container in privileged mode
+        volumeMounts: # inside the container
+        - name: sysfs-cgroup  # For accessing cgroup filesystem info
+          mountPath: /sys/fs/cgroup
+          readOnly: true
+        - name: tracefs  # tracefs filesystem that exposes kernel tracing information
+          mountPath: /sys/kernel/tracing
+          readOnly: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+      volumes: # Same volume on Host Node
+      - name: sysfs-cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+          type: Directory
+      - name: tracefs 
+        hostPath:
+          path: /sys/kernel/tracing
+          type: Directory
+      tolerations:  # 
+      - operator: Exists
