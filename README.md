@@ -120,8 +120,49 @@ roleRef:
   name: ebpf-tracer-role
 ```
 
+---
 
+## 3. Application Architecture
+### 1. eBPF C Program (`trace.bpf.c`)
+This file implements the kernel-level tracing logic using **eBPF**. The design focuses on **lightweight, safe, and portable kernel monitoring**.
+- eBPF programs run in a **restricted C subset** enforced by the kernel verifier.  
+- No loops with unknown bounds, limited pointer arithmetic, and safe memory access are required.  
+- Ensures the program cannot crash the kernel.
 
+#### 1. Event Structure 
+Captures filesystem events (mkdir, open, symlink, etc.). Type identifies the syscall type, cgroup stores the current cgroup ID.
+```c
+struct event {
+    char type[8];
+    u64 cgroup;
+};
+```
+#### 2. BPF Maps
+- **cgroup_filter** (HASH map):
+  - Stores allowed cgroup IDs for filtering events
+  - Key: cgroup id (u64), Value: dummy (u32)
+
+- **events** (RINGBUF map):
+  - Transfers events from kernel to user-space
+  - Efficient, lock-free, supports high-frequency events
+
+Maps are declared with SEC(".maps") and loaded by libbpf/libbpfgo in the Go daemon.
+
+#### 3. Tracepoints & Filtering
+- Each function attaches to a specific syscall tracepoint (sys_enter_mkdir, sys_enter_open, etc.)
+- Macro FILTER_AND_RESERVE:
+  - Reads current cgroup ID (bpf_get_current_cgroup_id())
+  - Filters out irrelevant cgroups using cgroup_filter
+  - Reserves an event in the events ring buffer
+- bpf_probe_read_str() safely copies the syscall name into the event structure.
+- bpf_ringbuf_submit() publishes the event to user-space.
+
+### 2. GO-Lang Daemon (daemon)
+This Go program acts as the **user-space companion** to the eBPF kernel program, responsible for **loading, managing, and consuming eBPF events** in a Kubernetes environment.
+- **Load eBPF Object:** Uses `libbpfgo` to load the compiled `trace.bpf.o` into the kernel.
+- **Manage BPF Maps:** Updates `cgroup_filter` and reads `events` from the eBPF ring buffer.
+- **Pod Mapping:** Maps cgroup IDs to Kubernetes pods by querying the cluster API.
+- **Event Processing:** Reads events from the ring buffer, correlates them with pod information, and prints structured logs.
 
 
 
