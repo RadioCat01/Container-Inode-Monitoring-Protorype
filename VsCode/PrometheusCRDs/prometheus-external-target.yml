@@ -1,0 +1,30 @@
+#To provide actual address
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: vm-host-daemon-external
+  namespace: default
+subsets:
+  - addresses:
+      - ip: 192.168.122.102 
+    ports:
+      - port: 9091
+        name: metrics
+
+---
+#Provide Stable DNS - let Prometheus pod discover this
+apiVersion: v1
+kind: Service
+metadata:
+  name: vm-host-daemon-external
+  namespace: default
+  labels:
+    app: ebpf-host-exporter
+    release: prometheus
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9091
+      targetPort: 9091
+      protocol: TCP
+      name: metrics

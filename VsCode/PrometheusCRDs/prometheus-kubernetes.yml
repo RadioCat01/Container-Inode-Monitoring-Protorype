@@ -1,0 +1,16 @@
+#Crucial configuraion(must) to let Prometheus Operator to configure monitoring targets.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ebpf-tracer-monitor
+  namespace: default
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ebpf-host-tracer-app
+  podMetricsEndpoints:
+  - port: metrics-port 
+    path: /metrics
+    interval: 5s
