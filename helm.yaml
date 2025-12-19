@@ -1,0 +1,22 @@
+# minimal-values.yaml
+alertmanager:
+  enabled: false
+
+kubeStateMetrics:
+  enabled: false
+
+nodeExporter:
+  enabled: false
+
+grafana:
+  enabled: true
+  replicas: 1
+
+prometheus:
+  prometheusSpec:
+    retention: 6h
+    retentionSize: 1GB
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
