@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,8 @@ import (
 	"unsafe"
 
 	"github.com/aquasecurity/libbpfgo"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -24,9 +27,26 @@ type event struct {
 	Cgroup uint64
 }
 
+type PodInfo struct {
+	Name      string
+	Namespace string
+}
+
 var mapMutex sync.Mutex
 var inoToCgroupPath = make(map[uint64]string)
-var uidToPodName = make(map[string]string)
+
+// var uidToPodName = make(map[string]string)
+var uidToPodInfo = make(map[string]PodInfo)
+
+var inodeOpTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name:      "container_inode_operation_total",
+		Help:      "Cumulative count of filesystem inode operations by type, pod, and namespace.",
+		Subsystem: "overlayfs_tracer",
+	},
+	// These are the labels Prometheus will use to segment the data
+	[]string{"operation", "pod_name", "namespace"},
+)
 
 func getCgroupInfo(root string, cgroupPrefix string) (map[uint64]string, error) {
 	info := make(map[uint64]string)
@@ -123,25 +143,56 @@ func refreshPodMap() error {
 	if nodeName == "" {
 		return fmt.Errorf("NODE_NAME environment variable not set")
 	}
+	// pods, err := clientset.CoreV1().Pods("").List(context.TODO(), v1.ListOptions{
+	// 	FieldSelector: "spec.nodeName=" + nodeName,
+	// })
+	// if err != nil {
+	// 	return err
+	// }
+	// newMap := make(map[string]string)
+	// for _, pod := range pods.Items {
+	// 	uid := string(pod.UID)
+	// 	name := pod.Name
+	// 	newMap[uid] = name
+	// }
+	// mapMutex.Lock()
+	// uidToPodName = newMap
+	// mapMutex.Unlock()
+	// return nil
+
 	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), v1.ListOptions{
 		FieldSelector: "spec.nodeName=" + nodeName,
 	})
 	if err != nil {
 		return err
 	}
-	newMap := make(map[string]string)
+	//newMap now stores the PodInfo struct
+	newMap := make(map[string]PodInfo)
 	for _, pod := range pods.Items {
 		uid := string(pod.UID)
-		name := pod.Name
-		newMap[uid] = name
+		//Retrieve Name AND Namespace
+		info := PodInfo{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		}
+		newMap[uid] = info
 	}
 	mapMutex.Lock()
-	uidToPodName = newMap
+	uidToPodInfo = newMap
 	mapMutex.Unlock()
 	return nil
 }
 
 func main() {
+	prometheus.MustRegister(inodeOpTotal)
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		//port exposed in the DaemonSet YAML (e.g., 9091)
+		fmt.Println("Starting metrics server on :9091/metrics")
+		if err := http.ListenAndServe(":9091", nil); err != nil {
+			fmt.Println("Metrics server failed:", err)
+		}
+	}()
 	candidates := []string{
 		"/sys/fs/cgroup/kubepods.slice",
 		"/sys/fs/cgroup/unified/kubepods.slice",
@@ -277,17 +328,49 @@ func main() {
 				}
 			}
 		}
+		// if podUID != "" {
+		// 	mapMutex.Lock()
+		// 	name, ok := uidToPodName[podUID]
+		// 	mapMutex.Unlock()
+		// 	if ok {
+		// 		fmt.Printf("[%s] pod=%s\n", typ, name)
+		// 	} else {
+		// 		fmt.Printf("[%s] podUID=%s\n", typ, podUID)
+		// 	}
+
 		if podUID != "" {
 			mapMutex.Lock()
-			name, ok := uidToPodName[podUID]
+			info, ok := uidToPodInfo[podUID]
 			mapMutex.Unlock()
+
+			var nameToUse string
+			var namespaceToUse string
+
 			if ok {
-				fmt.Printf("[%s] pod=%s\n", typ, name)
+				// Case 1: Pod Name/Namespace IS resolved. Use the correct data.
+				nameToUse = info.Name
+				namespaceToUse = info.Namespace
 			} else {
-				fmt.Printf("[%s] podUID=%s\n", typ, podUID)
+				// Case 2: Pod Name/Namespace IS NOT resolved. Use PodUID as fallback.
+
+				// For testing/debugging, use the PodUID for the name.
+				nameToUse = "unresolved_uid_" + podUID
+				namespaceToUse = "unresolved"
+
+				// Log the warning (optional, but good for debugging)
+				fmt.Printf("Warning: [%s] podUID=%s (Name not yet resolved, using fallback)\n", typ, podUID)
 			}
+
+			// CRITICAL: Increment the Prometheus Counter using the chosen labels
+			// This ensures the event is NEVER dropped if the podUID is available.
+			inodeOpTotal.With(prometheus.Labels{
+				"operation": typ,
+				"pod_name":  nameToUse,
+				"namespace": namespaceToUse,
+			}).Inc()
+
 		} else {
-			fmt.Printf("[%s] cgid=%d cgroup_path=%s\n", typ, e.Cgroup, cgroupPath)
+			// If cgroup path is not resolved to a pod (e.g., host process), ignore it for per-pod metrics.
 		}
 	}
 }
