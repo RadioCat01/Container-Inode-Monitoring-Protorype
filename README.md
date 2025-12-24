@@ -164,5 +164,9 @@ This Go program acts as the **user-space companion** to the eBPF kernel program,
 - **Pod Mapping:** Maps cgroup IDs to Kubernetes pods by querying the cluster API.
 - **Event Processing:** Reads events from the ring buffer, correlates them with pod information, and prints structured logs.
 
+### Sample Index Node Stress Workloads (Only for Testing)
+```
+cd /tmp && mkdir -p inode_data && seq 1 30000 | xargs -n1 -P8 -I{} sh -c 'echo {} > inode_data/f_{}'
+cd /tmp && mkdir -p churn && seq 1 20000 | xargs -n1 -P6 -I{} sh -c 'echo x > churn/a_{} && mv churn/a_{} churn/b_{}'
 
-
+```
