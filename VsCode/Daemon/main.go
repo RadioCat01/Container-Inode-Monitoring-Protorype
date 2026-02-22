@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -32,346 +33,337 @@ type PodInfo struct {
 	Namespace string
 }
 
-var mapMutex sync.Mutex
-var inoToCgroupPath = make(map[uint64]string)
-
-// var uidToPodName = make(map[string]string)
-var uidToPodInfo = make(map[string]PodInfo)
-
-var inodeOpTotal = prometheus.NewCounterVec(
-	prometheus.CounterOpts{
-		Name:      "container_inode_operation_total",
-		Help:      "Cumulative count of filesystem inode operations by type, pod, and namespace.",
-		Subsystem: "overlayfs_tracer",
-	},
-	// These are the labels Prometheus will use to segment the data
-	[]string{"operation", "pod_name", "namespace"},
+var (
+	mapMutex        sync.RWMutex
+	inoToCgroupPath = make(map[uint64]string)
+	uidToPodInfo    = make(map[string]PodInfo)
+	kubeClient      *kubernetes.Clientset
+	inodeOpTotal    = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:      "container_inode_operation_total",
+			Help:      "Cumulative count of filesystem inode operations by type, pod, and namespace.",
+			Subsystem: "overlayfs_tracer",
+		},
+		[]string{"operation", "pod_name", "namespace"},
+	)
 )
 
-func getCgroupInfo(root string, cgroupPrefix string) (map[uint64]string, error) {
-	info := make(map[uint64]string)
+//////////////////////////////////////////////////////////////
+// Kubernetes Client Initialization (only once)
+//////////////////////////////////////////////////////////////
+
+func initKubeClient() error {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return err
+	}
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+	kubeClient = client
+	return nil
+}
+
+//////////////////////////////////////////////////////////////
+// Cgroup Discovery
+//////////////////////////////////////////////////////////////
+
+func getCgroupInfo(root, prefix string) (map[uint64]string, error) {
+	result := make(map[uint64]string)
+
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			finfo, err := d.Info()
+			info, err := d.Info()
 			if err != nil {
 				return err
 			}
-			stat, ok := finfo.Sys().(*syscall.Stat_t) //type assertion (returned from d.info)
+			stat, ok := info.Sys().(*syscall.Stat_t)
 			if ok {
-				rel, err := filepath.Rel(root, path)
-				if err != nil {
-					return err
-				}
-				cgPath := cgroupPrefix
+				rel, _ := filepath.Rel(root, path)
+				fullPath := prefix
 				if rel != "." {
-					cgPath += "/" + rel
+					fullPath += "/" + rel
 				}
-				info[stat.Ino] = cgPath
+				result[stat.Ino] = fullPath
 			}
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	if len(info) == 0 {
-		return nil, fmt.Errorf("no cgroup info found")
-	}
-	return info, nil
+
+	return result, err
 }
 
-func refreshCgroupMap(cgroupMap *libbpfgo.BPFMap, root string, cgroupPrefix string) error {
-	newInfo, err := getCgroupInfo(root, cgroupPrefix)
+func refreshCgroupMap(bpfMap *libbpfgo.BPFMap, root, prefix string) error {
+	newInfo, err := getCgroupInfo(root, prefix)
 	if err != nil {
 		return err
 	}
+
 	mapMutex.Lock()
 	defer mapMutex.Unlock()
 
-	// Get existing keys
 	existing := make(map[uint64]struct{})
-	iterator := cgroupMap.Iterator()
-	var keyBytes []byte
-	for iterator.Next() {
-		keyBytes = iterator.Key()
-		key := binary.LittleEndian.Uint64(keyBytes)
+	iter := bpfMap.Iterator()
+	for iter.Next() {
+		key := binary.LittleEndian.Uint64(iter.Key())
 		existing[key] = struct{}{}
 	}
-	if iterator.Err() != nil {
-		return iterator.Err()
-	}
-	// Add new, delete old
+
 	dummy := uint32(1)
-	added, removed := 0, 0
+
 	for id := range newInfo {
 		if _, ok := existing[id]; !ok {
-			if err := cgroupMap.Update(unsafe.Pointer(&id), unsafe.Pointer(&dummy)); err == nil {
-				added++
-			} else {
-				fmt.Println("Warning: add failed for ID", id, ":", err)
-			}
+			bpfMap.Update(unsafe.Pointer(&id), unsafe.Pointer(&dummy))
 		}
 		delete(existing, id)
 	}
+
 	for id := range existing {
-		if err := cgroupMap.DeleteKey(unsafe.Pointer(&id)); err == nil {
-			removed++
-		} else {
-			fmt.Println("Warning: delete failed for ID", id, ":", err)
-		}
+		bpfMap.DeleteKey(unsafe.Pointer(&id))
 	}
+
 	inoToCgroupPath = newInfo
-	if added > 0 || removed > 0 {
-		fmt.Printf("Map refreshed: added %d, removed %d\n", added, removed)
-	}
 	return nil
 }
 
-func refreshPodMap() error {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return err
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return err
-	}
-	nodeName := os.Getenv("NODE_NAME") //provided at env of the yaml
-	if nodeName == "" {
-		return fmt.Errorf("NODE_NAME environment variable not set")
-	}
-	// pods, err := clientset.CoreV1().Pods("").List(context.TODO(), v1.ListOptions{
-	// 	FieldSelector: "spec.nodeName=" + nodeName,
-	// })
-	// if err != nil {
-	// 	return err
-	// }
-	// newMap := make(map[string]string)
-	// for _, pod := range pods.Items {
-	// 	uid := string(pod.UID)
-	// 	name := pod.Name
-	// 	newMap[uid] = name
-	// }
-	// mapMutex.Lock()
-	// uidToPodName = newMap
-	// mapMutex.Unlock()
-	// return nil
+//////////////////////////////////////////////////////////////
+// Pod Map Refresh
+//////////////////////////////////////////////////////////////
 
-	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), v1.ListOptions{
+func refreshPodMap(ctx context.Context) error {
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		return fmt.Errorf("NODE_NAME not set")
+	}
+
+	pods, err := kubeClient.CoreV1().Pods("").List(ctx, v1.ListOptions{
 		FieldSelector: "spec.nodeName=" + nodeName,
 	})
 	if err != nil {
 		return err
 	}
-	//newMap now stores the PodInfo struct
+
 	newMap := make(map[string]PodInfo)
 	for _, pod := range pods.Items {
-		uid := string(pod.UID)
-		//Retrieve Name AND Namespace
-		info := PodInfo{
+		newMap[string(pod.UID)] = PodInfo{
 			Name:      pod.Name,
 			Namespace: pod.Namespace,
 		}
-		newMap[uid] = info
 	}
+
 	mapMutex.Lock()
 	uidToPodInfo = newMap
 	mapMutex.Unlock()
+
 	return nil
 }
 
+//////////////////////////////////////////////////////////////
+// Utility: Extract Pod UID
+//////////////////////////////////////////////////////////////
+
+func extractPodUID(cgroupPath string) string {
+	parts := strings.Split(strings.TrimPrefix(cgroupPath, "/"), "/")
+
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+
+		if strings.HasPrefix(part, "pod") {
+			return strings.TrimPrefix(part, "pod")
+		}
+
+		if strings.HasSuffix(part, ".slice") && strings.Contains(part, "-pod") {
+			tmp := strings.SplitN(part, "-pod", 2)
+			if len(tmp) == 2 {
+				return strings.ReplaceAll(
+					strings.TrimSuffix(tmp[1], ".slice"),
+					"_",
+					"-",
+				)
+			}
+		}
+	}
+	return ""
+}
+
+//////////////////////////////////////////////////////////////
+// MAIN
+//////////////////////////////////////////////////////////////
+
 func main() {
+
+	//////////////////////////////////////////////////////////////
+	// Prometheus Server
+	//////////////////////////////////////////////////////////////
+
 	prometheus.MustRegister(inodeOpTotal)
+
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
-		//port exposed in the DaemonSet YAML (e.g., 9091)
-		fmt.Println("Starting metrics server on :9091/metrics")
-		if err := http.ListenAndServe(":9091", nil); err != nil {
-			fmt.Println("Metrics server failed:", err)
-		}
+		http.ListenAndServe(":9091", nil)
 	}()
+
+	//////////////////////////////////////////////////////////////
+	// Kubernetes Client
+	//////////////////////////////////////////////////////////////
+
+	if err := initKubeClient(); err != nil {
+		fmt.Println("Kubernetes client init failed:", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	//////////////////////////////////////////////////////////////
+	// Locate Cgroup Root
+	//////////////////////////////////////////////////////////////
+
 	candidates := []string{
 		"/sys/fs/cgroup/kubepods.slice",
 		"/sys/fs/cgroup/unified/kubepods.slice",
 		"/sys/fs/cgroup/kubepods",
 	}
+
 	var root string
-	for _, path := range candidates {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			root = path
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			root = p
 			break
 		}
 	}
+
 	if root == "" {
-		fmt.Println("kubepods path not found under /sys/fs/cgroup. Inspect /sys/fs/cgroup manually.")
+		fmt.Println("kubepods path not found")
 		os.Exit(1)
 	}
-	cgroupPrefix := "/" + filepath.Base(root)
-	fmt.Println("Using ROOT =", root, "with cgroup prefix =", cgroupPrefix)
 
-	// Load eBPF module
+	prefix := "/" + filepath.Base(root)
+
+	//////////////////////////////////////////////////////////////
+	// Load eBPF
+	//////////////////////////////////////////////////////////////
+
 	module, err := libbpfgo.NewModuleFromFile("trace.bpf.o")
 	if err != nil {
-		fmt.Println("Error loading eBPF object:", err)
-		os.Exit(1)
+		panic(err)
 	}
 	defer module.Close()
 
-	// Load the eBPF object into the kernel
-	err = module.BPFLoadObject()
-	if err != nil {
-		fmt.Println("Error loading BPF object into kernel:", err)
-		os.Exit(1)
+	if err := module.BPFLoadObject(); err != nil {
+		panic(err)
 	}
 
-	// Get cgroup map
-	cgroupMap, err := module.GetMap("cgroup_filter")
-	if err != nil {
-		fmt.Println("Error getting map:", err)
-		os.Exit(1)
-	}
+	cgroupMap, _ := module.GetMap("cgroup_filter")
 
-	// Initial refresh
-	err = refreshCgroupMap(cgroupMap, root, cgroupPrefix)
-	if err != nil {
-		fmt.Println("Initial refresh failed:", err)
-	}
+	refreshCgroupMap(cgroupMap, root, prefix)
+	refreshPodMap(ctx)
 
-	// Start background refresh goroutine for cgroups
+	//////////////////////////////////////////////////////////////
+	// Background Refresh
+	//////////////////////////////////////////////////////////////
+
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
 		for range ticker.C {
-			err := refreshCgroupMap(cgroupMap, root, cgroupPrefix)
-			if err != nil {
-				fmt.Println("Refresh failed:", err)
-			}
+			refreshCgroupMap(cgroupMap, root, prefix)
 		}
 	}()
-	// Initial pod map refresh
-	err = refreshPodMap()
-	if err != nil {
-		fmt.Println("Initial pod map refresh failed (tool may not be running in a pod with appropriate permissions):", err)
-	}
-	// Start background refresh goroutine for pod map
+
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
 		for range ticker.C {
-			err := refreshPodMap()
-			if err != nil {
-				fmt.Println("Pod map refresh failed:", err)
-			}
+			refreshPodMap(ctx)
 		}
 	}()
-	// Attach to all tracepoints
+
+	//////////////////////////////////////////////////////////////
+	// Attach Tracepoints
+	//////////////////////////////////////////////////////////////
+
 	tracepoints := []string{
 		"mkdir", "mkdirat",
 		"open", "openat",
 		"mknod", "mknodat",
 		"symlink", "symlinkat",
 	}
+
 	for _, tp := range tracepoints {
 		prog, err := module.GetProgram("trace_" + tp)
 		if err != nil {
-			fmt.Println("Error getting program:", err)
 			continue
 		}
-		_, err = prog.AttachTracepoint("syscalls", "sys_enter_"+tp)
-		if err != nil {
-			fmt.Println("Error attaching sys_enter_"+tp+":", err)
-		}
+		prog.AttachTracepoint("syscalls", "sys_enter_"+tp)
 	}
-	// Initialize ring buffer
+
+	//////////////////////////////////////////////////////////////
+	// Ring Buffer
+	//////////////////////////////////////////////////////////////
+
 	eventsChan := make(chan []byte, 1024)
-	rb, err := module.InitRingBuf("events", eventsChan)
-	if err != nil {
-		fmt.Println("Error initializing ringbuf:", err)
-		os.Exit(1)
-	}
+	rb, _ := module.InitRingBuf("events", eventsChan)
 	rb.Start()
 	defer rb.Stop()
 
-	fmt.Println("Tracing started. Press Ctrl+C to stop.")
+	//////////////////////////////////////////////////////////////
+	// Graceful Shutdown
+	//////////////////////////////////////////////////////////////
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sig
+		cancel()
+		rb.Stop()
+		os.Exit(0)
+	}()
+
+	//////////////////////////////////////////////////////////////
+	// Event Loop
+	//////////////////////////////////////////////////////////////
 
 	for data := range eventsChan {
 		var e event
-		err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e)
-		if err != nil {
-			fmt.Println("Error parsing event:", err)
+		if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
 			continue
 		}
-		typ := strings.TrimRight(string(e.Type[:]), "\x00")
-		mapMutex.Lock()
+
+		op := strings.TrimRight(string(e.Type[:]), "\x00")
+
+		mapMutex.RLock()
 		cgroupPath, ok := inoToCgroupPath[e.Cgroup]
-		mapMutex.Unlock()
+		mapMutex.RUnlock()
 		if !ok {
-			fmt.Printf("[%s] cgid=%d (no cgroup path found)\n", typ, e.Cgroup)
 			continue
 		}
-		// Parse path to extract pod UID
-		var podUID string
-		parts := strings.Split(strings.TrimPrefix(cgroupPath, "/"), "/")
-		for i := len(parts) - 1; i >= 0; i-- {
-			part := parts[i]
-			if strings.HasPrefix(part, "pod") {
-				podUID = strings.TrimPrefix(part, "pod")
-				break
-			} else if strings.HasSuffix(part, ".slice") && strings.Contains(part, "-pod") {
-				podParts := strings.SplitN(part, "-pod", 2)
-				if len(podParts) == 2 {
-					podUID = strings.ReplaceAll(strings.TrimSuffix(podParts[1], ".slice"), "_", "-")
-					break
-				}
-			}
+
+		podUID := extractPodUID(cgroupPath)
+		if podUID == "" {
+			continue
 		}
-		// if podUID != "" {
-		// 	mapMutex.Lock()
-		// 	name, ok := uidToPodName[podUID]
-		// 	mapMutex.Unlock()
-		// 	if ok {
-		// 		fmt.Printf("[%s] pod=%s\n", typ, name)
-		// 	} else {
-		// 		fmt.Printf("[%s] podUID=%s\n", typ, podUID)
-		// 	}
 
-		if podUID != "" {
-			mapMutex.Lock()
-			info, ok := uidToPodInfo[podUID]
-			mapMutex.Unlock()
+		mapMutex.RLock()
+		info, ok := uidToPodInfo[podUID]
+		mapMutex.RUnlock()
 
-			var nameToUse string
-			var namespaceToUse string
+		podName := "unknown"
+		namespace := "unknown"
 
-			if ok {
-				// Case 1: Pod Name/Namespace IS resolved. Use the correct data.
-				nameToUse = info.Name
-				namespaceToUse = info.Namespace
-			} else {
-				// Case 2: Pod Name/Namespace IS NOT resolved. Use PodUID as fallback.
-
-				// For testing/debugging, use the PodUID for the name.
-				nameToUse = "unresolved_uid_" + podUID
-				namespaceToUse = "unresolved"
-
-				// Log the warning (optional, but good for debugging)
-				fmt.Printf("Warning: [%s] podUID=%s (Name not yet resolved, using fallback)\n", typ, podUID)
-			}
-
-			// CRITICAL: Increment the Prometheus Counter using the chosen labels
-			// This ensures the event is NEVER dropped if the podUID is available.
-			inodeOpTotal.With(prometheus.Labels{
-				"operation": typ,
-				"pod_name":  nameToUse,
-				"namespace": namespaceToUse,
-			}).Inc()
-
-		} else {
-			// If cgroup path is not resolved to a pod (e.g., host process), ignore it for per-pod metrics.
+		if ok {
+			podName = info.Name
+			namespace = info.Namespace
 		}
+
+		inodeOpTotal.With(prometheus.Labels{
+			"operation": op,
+			"pod_name":  podName,
+			"namespace": namespace,
+		}).Inc()
 	}
 }
 

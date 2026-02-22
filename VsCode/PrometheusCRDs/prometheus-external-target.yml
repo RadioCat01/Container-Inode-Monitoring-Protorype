@@ -28,3 +28,7 @@ spec:
       targetPort: 9091
       protocol: TCP
       name: metrics
+
+# sum by (pod_name, namespace) (
+#   overlayfs_tracer_container_inode_operation_total
+# )
