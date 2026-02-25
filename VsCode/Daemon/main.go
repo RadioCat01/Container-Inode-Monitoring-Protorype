@@ -49,6 +49,54 @@ var (
 )
 
 //////////////////////////////////////////////////////////////
+// Inode Measures
+//////////////////////////////////////////////////////////////
+
+var (
+	// Gauges: current total/free/used inodes per pod
+	overlayInodeTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:      "overlayfs_inode_total",
+			Help:      "Total inode count of overlay upperdir per pod.",
+			Subsystem: "overlayfs_tracer",
+		},
+		[]string{"pod_name", "namespace"},
+	)
+
+	overlayInodeFree = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:      "overlayfs_inode_free",
+			Help:      "Free inode count of overlay upperdir per pod.",
+			Subsystem: "overlayfs_tracer",
+		},
+		[]string{"pod_name", "namespace"},
+	)
+
+	overlayInodeUsed = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:      "overlayfs_inode_used",
+			Help:      "Used inode count of overlay upperdir per pod.",
+			Subsystem: "overlayfs_tracer",
+		},
+		[]string{"pod_name", "namespace"},
+	)
+
+	// Counter: positive increases in used inodes per sampling (so increase() works)
+	overlayInodeUsedDelta = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:      "overlayfs_inode_used_delta_total",
+			Help:      "Accumulated positive delta of used inodes detected per pod (sampling-based).",
+			Subsystem: "overlayfs_tracer",
+		},
+		[]string{"pod_name", "namespace"},
+	)
+
+	// Runtime maps
+	upperdirMap   = make(map[string]string) // podUID -> upperdir (host path)
+	inodePrevUsed = make(map[string]uint64) // podUID -> last used count (Files - Ffree)
+)
+
+//////////////////////////////////////////////////////////////
 // Kubernetes Client Initialization (only once)
 //////////////////////////////////////////////////////////////
 
@@ -191,6 +239,182 @@ func extractPodUID(cgroupPath string) string {
 }
 
 //////////////////////////////////////////////////////////////
+// Utility: Extract Pod PID
+//////////////////////////////////////////////////////////////
+
+func findAnyPidForPod(podUID string) (string, error) {
+	mapMutex.RLock()
+	// snapshot the paths (to avoid holding lock while doing IO)
+	paths := make([]string, 0, len(inoToCgroupPath))
+	for _, p := range inoToCgroupPath {
+		if strings.Contains(p, podUID) {
+			paths = append(paths, p)
+		}
+	}
+	mapMutex.RUnlock()
+
+	for _, p := range paths {
+		procsPath := filepath.Join("/sys/fs/cgroup", p, "cgroup.procs")
+		data, err := os.ReadFile(procsPath)
+		if err != nil {
+			continue
+		}
+		lines := strings.Fields(strings.TrimSpace(string(data)))
+		if len(lines) > 0 {
+			return lines[0], nil // return first PID
+		}
+	}
+	return "", fmt.Errorf("no pid found for podUID %s", podUID)
+}
+
+//////////////////////////////////////////////////////////////
+// Utility: Extract Upperdir for POD PID
+//////////////////////////////////////////////////////////////
+
+func findUpperdirForPid(pid string) (string, error) {
+	miPath := filepath.Join("/proc", pid, "mountinfo")
+	data, err := os.ReadFile(miPath)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// mountinfo format: fields ... - fstype source mountopts ...
+		// We can search the options part for "upperdir="
+		// Simpler: search the whole line for "overlay" and "upperdir="
+		if strings.Contains(line, " overlay ") && strings.Contains(line, "upperdir=") {
+			// options usually after the 6th field; but just extract upperdir=... portion
+			idx := strings.Index(line, "upperdir=")
+			if idx >= 0 {
+				rest := line[idx+len("upperdir="):]
+				// upperdir value ends at comma or space
+				end := strings.IndexAny(rest, ", ")
+				if end == -1 {
+					end = len(rest)
+				}
+				upper := rest[:end]
+				return upper, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("upperdir not found in mountinfo for pid %s", pid)
+}
+
+//////////////////////////////////////////////////////////////
+// Utility: Extract Upperdir for POD
+//////////////////////////////////////////////////////////////
+
+func discoverUpperdirForPod(podUID, podName, namespace string) {
+	// quickly return if already discovered
+	mapMutex.RLock()
+	_, ok := upperdirMap[podUID]
+	mapMutex.RUnlock()
+	if ok {
+		return
+	}
+
+	// try a few times with small backoff
+	for i := 0; i < 4; i++ {
+		pid, err := findAnyPidForPod(podUID)
+		if err == nil && pid != "" {
+			upper, err := findUpperdirForPid(pid)
+			if err == nil && upper != "" {
+				mapMutex.Lock()
+				// store host path; dedupe
+				upperdirMap[podUID] = upper
+				// initialize prev used to 0 so first sample sets baseline
+				inodePrevUsed[podUID] = 0
+				mapMutex.Unlock()
+				fmt.Printf("Discovered upperdir for pod %s/%s: %s\n", namespace, podName, upper)
+				return
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	// failed: keep trying next sample (no tight loop)
+	fmt.Printf("Warning: failed to discover upperdir for pod %s\n", podUID)
+}
+
+//////////////////////////////////////////////////////////////
+// Utility: POD Sampling Main Function
+//////////////////////////////////////////////////////////////
+
+func sampleInodes(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	fmt.Println("Sampling tick triggered")
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// snapshot keys
+			mapMutex.RLock()
+			pods := make([]struct {
+				podUID   string
+				upperdir string
+			}, 0, len(upperdirMap))
+			for podUID, upper := range upperdirMap {
+				pods = append(pods, struct {
+					podUID   string
+					upperdir string
+				}{podUID, upper})
+			}
+			fmt.Printf("upperdirMap size at tick: %d\n", len(upperdirMap))
+			mapMutex.RUnlock()
+
+			for _, p := range pods {
+				// do the statfs
+				fmt.Printf("Sampling upperdir: %s\n", p.upperdir)
+
+				var st syscall.Statfs_t
+				err := syscall.Statfs(p.upperdir, &st)
+				if err != nil {
+					fmt.Printf("Statfs ERROR for %s: %v\n", p.upperdir, err)
+					continue
+				}
+
+				fmt.Printf("Files=%d, Ffree=%d\n", st.Files, st.Ffree)
+
+				total := uint64(st.Files)
+				free := uint64(st.Ffree)
+				used := total - free
+
+				// map podUID -> pod name/namespace for labels
+				mapMutex.RLock()
+				info, ok := uidToPodInfo[p.podUID]
+				mapMutex.RUnlock()
+
+				pn := "unknown"
+				ns := "unknown"
+				if ok {
+					pn = info.Name
+					ns = info.Namespace
+				}
+
+				// update gauges
+				overlayInodeTotal.WithLabelValues(pn, ns).Set(float64(total))
+				overlayInodeFree.WithLabelValues(pn, ns).Set(float64(free))
+				overlayInodeUsed.WithLabelValues(pn, ns).Set(float64(used))
+
+				// compute delta using prev snapshot
+				mapMutex.Lock()
+				prev := inodePrevUsed[p.podUID]
+				if used > prev {
+					delta := used - prev
+					overlayInodeUsedDelta.WithLabelValues(pn, ns).Add(float64(delta))
+				}
+				inodePrevUsed[p.podUID] = used
+				mapMutex.Unlock()
+			}
+		}
+	}
+}
+
+//////////////////////////////////////////////////////////////
 // MAIN
 //////////////////////////////////////////////////////////////
 
@@ -201,6 +425,10 @@ func main() {
 	//////////////////////////////////////////////////////////////
 
 	prometheus.MustRegister(inodeOpTotal)
+	prometheus.MustRegister(overlayInodeTotal)
+	prometheus.MustRegister(overlayInodeFree)
+	prometheus.MustRegister(overlayInodeUsed)
+	prometheus.MustRegister(overlayInodeUsedDelta)
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
@@ -281,6 +509,8 @@ func main() {
 		}
 	}()
 
+	go sampleInodes(ctx, 15*time.Second)
+
 	//////////////////////////////////////////////////////////////
 	// Attach Tracepoints
 	//////////////////////////////////////////////////////////////
@@ -359,12 +589,21 @@ func main() {
 			namespace = info.Namespace
 		}
 
+		mapMutex.RLock()
+		_, exists := upperdirMap[podUID]
+		mapMutex.RUnlock()
+		if !exists {
+			// run discovery async; do not block event loop
+			go discoverUpperdirForPod(podUID, podName, namespace)
+		}
+
 		inodeOpTotal.With(prometheus.Labels{
 			"operation": op,
 			"pod_name":  podName,
 			"namespace": namespace,
 		}).Inc()
 	}
+
 }
 
 // CGO_CFLAGS="$(pkg-config --cflags libbpf)" \

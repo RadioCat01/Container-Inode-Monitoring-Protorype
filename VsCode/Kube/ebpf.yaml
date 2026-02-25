@@ -69,7 +69,7 @@ spec:
       hostPID: true
       containers:
       - name: tracer
-        image: radiocat2000/ebpf:latest  
+        image: radiocat2000/ebpf-tracer:v6
         imagePullPolicy: Always  
         securityContext:
           privileged: true
@@ -82,6 +82,9 @@ spec:
           readOnly: true
         - name: tracefs
           mountPath: /sys/kernel/tracing
+          readOnly: true
+        - name: containerd-overlay
+          mountPath: /var/snap/microk8s/common/var/lib/containerd
           readOnly: true
         env:
         - name: NODE_NAME
@@ -96,6 +99,10 @@ spec:
       - name: tracefs 
         hostPath:
           path: /sys/kernel/tracing
+          type: Directory
+      - name: containerd-overlay
+        hostPath:
+          path: /var/snap/microk8s/common/var/lib/containerd
           type: Directory
       tolerations:
       - operator: Exists
