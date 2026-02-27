@@ -344,7 +344,6 @@ func discoverUpperdirForPod(podUID, podName, namespace string) {
 
 func sampleInodes(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
-	fmt.Println("Sampling tick triggered")
 	defer ticker.Stop()
 	for {
 		select {
@@ -363,21 +362,16 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 					upperdir string
 				}{podUID, upper})
 			}
-			fmt.Printf("upperdirMap size at tick: %d\n", len(upperdirMap))
 			mapMutex.RUnlock()
 
 			for _, p := range pods {
 				// do the statfs
-				fmt.Printf("Sampling upperdir: %s\n", p.upperdir)
 
 				var st syscall.Statfs_t
 				err := syscall.Statfs(p.upperdir, &st)
 				if err != nil {
-					fmt.Printf("Statfs ERROR for %s: %v\n", p.upperdir, err)
 					continue
 				}
-
-				fmt.Printf("Files=%d, Ffree=%d\n", st.Files, st.Ffree)
 
 				total := uint64(st.Files)
 				free := uint64(st.Ffree)
