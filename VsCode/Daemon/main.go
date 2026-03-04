@@ -183,6 +183,8 @@ func refreshCgroupMap(bpfMap *libbpfgo.BPFMap, root, prefix string) error {
 //////////////////////////////////////////////////////////////
 
 func refreshPodMap(ctx context.Context) error {
+	fmt.Println("Refreshing Pod Map")
+
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
 		return fmt.Errorf("NODE_NAME not set")
@@ -204,8 +206,40 @@ func refreshPodMap(ctx context.Context) error {
 	}
 
 	mapMutex.Lock()
+	defer mapMutex.Unlock()
+
+	// 🔹 Keep reference to old map BEFORE replacing
+	oldMap := uidToPodInfo
+
+	// 🔹 Detect deleted pods
+	for uid, oldInfo := range oldMap {
+		if _, stillExists := newMap[uid]; !stillExists {
+
+			fmt.Printf("Pod deleted detected: %s/%s\n", oldInfo.Namespace, oldInfo.Name)
+
+			// Remove runtime tracking
+			delete(upperdirMap, uid)
+			delete(inodePrevUsed, uid)
+
+			// Remove Prometheus metrics
+			overlayInodeTotal.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
+			overlayInodeFree.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
+			overlayInodeUsed.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
+			overlayInodeUsedDelta.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
+
+			for _, op := range []string{
+				"mkdir", "mkdirat",
+				"open", "openat",
+				"mknod", "mknodat",
+				"symlink", "symlinkat",
+			} {
+				inodeOpTotal.DeleteLabelValues(op, oldInfo.Name, oldInfo.Namespace)
+			}
+		}
+	}
+
+	// 🔹 Now replace old map
 	uidToPodInfo = newMap
-	mapMutex.Unlock()
 
 	return nil
 }
@@ -362,6 +396,12 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 					upperdir string
 				}{podUID, upper})
 			}
+
+			fmt.Println("Current upperdirMap entries:")
+			for uid, upper := range upperdirMap {
+				fmt.Printf("  podUID=%s -> upperdir=%s\n", uid, upper)
+			}
+
 			mapMutex.RUnlock()
 
 			for _, p := range pods {
