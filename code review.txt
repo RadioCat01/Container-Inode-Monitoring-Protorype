@@ -1,0 +1,261 @@
+Code Review: eBPF Inode Exhaustion Tracer
+An unbiased analysis of 
+trace.ebpf.c
+ and 
+main.go
+, covering what works well, what has pitfalls, and what should be improved.
+
+What Currently Works Well
+Aspect	Notes
+Cgroup-based filtering	The cgroup_filter BPF hash map + FILTER_AND_RESERVE macro is a clean design — events fire only for pods you care about, limiting noise
+Ring buffer for events	Using BPF_MAP_TYPE_RINGBUF instead of perf buffers is the modern, lower-overhead choice
+Dynamic map refresh	The Go side periodically reconciles cgroup_filter keys (add new, delete stale), handling pod churn gracefully
+Pod UID ↔ Name resolution	The two-phase approach (cgroup inode → cgroup path → pod UID → K8s API name) is sound and covers both cgroupv2 and systemd-slice naming
+Prometheus metrics	Counters with 
+(operation, pod_name, namespace)
+ labels provide the right granularity for Grafana dashboards
+Fallback for unresolved pods	Events are never dropped when podUID exists but name isn't resolved yet — good for accuracy
+Critical Pitfalls & Bugs
+1. Missing 
+link
+ / hardlink syscall tracing (eBPF)
+CAUTION
+
+link()
+ and 
+linkat()
+ create new directory entries (inodes from the filesystem's perspective) but are not traced. A workload calling 
+linkat()
+ in a loop would exhaust inodes without any event being emitted.
+
+Hard links are a classic inode-consuming operation and especially relevant for overlayFS copy-up scenarios: when overlayFS performs a copy-up it may create hard links in the upper directory.
+
+Also missing: rename() / renameat() / renameat2(). While renames don't create new inodes, in overlayFS they trigger copy-up of the source file into the upper layer, which does consume an inode. If your research focuses on overlayFS-specific inode consumption, this is a gap.
+
+2. Missing delete syscall tracing — no inode release tracking (eBPF)
+IMPORTANT
+
+You trace only inode-creating syscalls (
+mkdir
+, open+O_CREAT, 
+mknod
+, 
+symlink
+), but you never trace inode-freeing syscalls: unlink, unlinkat, rmdir. Your Prometheus counter container_inode_operation_total is a monotonically increasing counter that will overcount the actual live inode count. For "risk of inode exhaustion" research, you need the net inode delta, not just creation events.
+
+Without delete tracking, you cannot compute current_inodes = created - deleted. A pod that creates 10,000 temp files and deletes 9,999 would look just as dangerous as one that creates 10,000 and keeps them all.
+
+Recommendation: Either:
+
+Add unlink/unlinkat/rmdir tracepoints and use a Prometheus Gauge instead of a Counter, or
+Keep the Counter approach but add a separate counter for deletions so the net can be computed in PromQL
+3. Missing openat2() tracing (eBPF)
+WARNING
+
+Modern Linux kernels (5.6+) introduce openat2() which can also create files. Your code traces 
+open
+ and 
+openat
+ but not openat2. Depending on the kernel and userspace C library version on your cluster nodes, some file creations may go undetected.
+
+The tracepoint is tracepoint/syscalls/sys_enter_openat2. The flags are in an open_how struct passed at args[1], so the flag check would need a bpf_probe_read_user to read the struct.
+
+4. cgroup_filter map uses inode number as key — but eBPF uses cgroup ID (Go ↔ eBPF mismatch)
+CAUTION
+
+This is the most subtle bug in the codebase.
+
+In 
+main.go
+ line 62:
+
+go
+stat, ok := finfo.Sys().(*syscall.Stat_t)
+// ...
+info[stat.Ino] = cgPath   // ← uses inode number from stat()
+But in 
+trace.ebpf.c
+ line 26:
+
+c
+u64 cg = bpf_get_current_cgroup_id();  // ← uses cgroup ID
+bpf_get_current_cgroup_id() returns the cgroup ID, which on cgroupv2 is the inode number of the cgroup directory. So on a pure cgroupv2 system, these happen to be the same value, and the code works.
+
+However:
+
+On hybrid cgroup setups (cgroupv1+v2), the cgroup ID from bpf_get_current_cgroup_id() may not match the stat.Ino of the directory you're walking
+The code path "/sys/fs/cgroup/unified/kubepods.slice" (line 198) explicitly supports hybrid setups, but the key matching would silently fail there
+If the Go walk is performed on a mounted cgroup view (in the container's mount namespace via the hostPath volume), the inode numbers might differ from the host's cgroup filesystem
+Recommendation: Use the kernel's cgroup.id file (available since Linux 5.x) or name_to_handle_at() to get the actual cgroup ID, rather than relying on stat.Ino.
+
+5. 
+open()
+ flags argument index may be wrong on some architectures (eBPF)
+In 
+trace_open
+:
+
+c
+u64 flags = BPF_CORE_READ(ctx, args[1]);  // open(pathname, flags, mode)
+And 
+trace_openat
+:
+
+c
+u64 flags = BPF_CORE_READ(ctx, args[2]);  // openat(dirfd, pathname, flags, mode)
+The argument indexing is correct for x86_64. However, on arm64 and other architectures, the sys_enter tracepoint may pack arguments differently. Since you're using BPF_CORE_READ, this should be portable — but verify on your target architecture. Also, O_CREAT is 0x40 on x86_64 but 0x100 on some other architectures (e.g., MIPS). If this will ever run on ARM nodes, use a CO-RE approach or kernel-defined constant.
+
+6. event.Type field is only 8 bytes — truncation risk (eBPF)
+c
+struct event {
+    char type[8];
+    u64 cgroup;
+};
+Current longest type name: "symlinkat" = 10 chars (9 + null). It will be truncated to "symlink\0". This means 
+symlink
+ and 
+symlinkat
+ events are indistinguishable via the type field.
+
+Similarly "mkdirat" (8 bytes including null) just barely fits, but any future type name like "renameat2" won't.
+
+Fix: Increase to at least 16 bytes:
+
+c
+struct event {
+    char type[16];
+    u64 cgroup;
+};
+And update the Go struct accordingly:
+
+go
+type event struct {
+    Type   [16]byte
+    Cgroup uint64
+}
+7. Ring buffer size may be too small under high load (eBPF)
+c
+__uint(max_entries, 256 * 1024);  // 256 KB
+Under a burst scenario (which is exactly what a malicious inode-exhaustion pod would cause), a fast 
+mkdir
+ loop can generate thousands of events per second. At ~16 bytes per event the buffer holds ~16K events. If the Go consumer stalls (e.g., during a mutex lock in 
+refreshCgroupMap
+), events will be silently dropped.
+
+Recommendation: Increase to at least 1 MB (1024 * 1024), or better, add a dropped-events counter via bpf_ringbuf_discard or monitor rb.GetEpollFd() loss on the Go side.
+
+8. Race condition between cgroup map refresh and event processing (Go)
+The mapMutex protects both inoToCgroupPath and uidToPodInfo, but the critical section in the event loop is too narrow:
+
+go
+mapMutex.Lock()
+cgroupPath, ok := inoToCgroupPath[e.Cgroup]
+mapMutex.Unlock()
+// ... parse podUID from cgroupPath ...
+mapMutex.Lock()
+info, ok := uidToPodInfo[podUID]
+mapMutex.Unlock()
+Between the two lock/unlock pairs, inoToCgroupPath could be replaced by 
+refreshCgroupMap
+ (line 126: inoToCgroupPath = newInfo). The cgroupPath value is safe (it's a string copy), but the logical consistency between cgroup path and pod info isn't guaranteed.
+
+This is a minor race — the worst case is a temporarily mismatched metric label — but for research correctness you may want a sync.RWMutex with read locks, or a single atomic pointer swap.
+
+9. 
+refreshPodMap
+ creates a new K8s client on every call (Go)
+go
+func refreshPodMap() error {
+    config, err := rest.InClusterConfig()
+    clientset, err := kubernetes.NewForConfig(config)
+    // ... list pods ...
+}
+WARNING
+
+On every 60-second tick, a new HTTP/2 connection is established to the API server, TLS handshake included. This is wasteful and adds latency. Under heavy pod churn, this could also hit API server rate limits.
+
+Fix: Create the clientset once in 
+main()
+ and pass it (or store it in a package-level variable). kubernetes.Clientset is safe for concurrent use.
+
+10. No graceful shutdown (Go)
+The program has no signal handling. On SIGTERM (which is what Kubernetes sends during pod termination):
+
+The ring buffer rb.Stop() runs via defer, but for data := range eventsChan blocks forever
+BPF programs remain attached (they'll be cleaned up by the kernel, but file descriptors leak during ungraceful exit)
+In-flight events in eventsChan are lost
+Fix: Use signal.NotifyContext or context.WithCancel and select on both the events channel and context cancellation.
+
+11. Prometheus label cardinality explosion (Go)
+go
+nameToUse = "unresolved_uid_" + podUID
+Every unresolved pod UID creates a unique Prometheus time series. If pods churn rapidly (e.g., Jobs, CronJobs), you'll accumulate stale time series that never get cleaned up, increasing Prometheus memory usage.
+
+Fix:
+
+Use a static label like "unresolved" for unresolved pods, and log the UID separately
+Or register a prometheus.NewGaugeVec with TTL-based cleanup
+OverlayFS-Specific Gaps for Your Research
+Since your research goal is about overlayFS inode exhaustion, there are several OverlayFS-specific behaviors that the current syscall-level tracing does not capture:
+
+OverlayFS Behavior	Why It Matters	Current Status
+Copy-up	When a file in the lower layer is modified, overlayFS copies it to the upper layer, consuming a new inode	❌ Not detected — copy-up is triggered by 
+open(O_WRONLY)
+ which doesn't have O_CREAT, and by chmod, chown, setxattr, etc.
+Whiteout files	When a file is deleted in the overlay, a special character device (whiteout) is created in the upper dir — this consumes an inode even though the user ran unlink	❌ Not detected — appears as unlink (not traced) but actually creates a new inode
+Opaque directories	When rm -rf dir runs, overlayFS creates an opaque directory marker, consuming inodes	❌ Not detected
+Metacopy	Some overlayFS mounts use metacopy (metadata-only copy-up), which still creates inodes but copies less data	❌ Not detected
+IMPORTANT
+
+These are arguably the most important inode-consuming events for your research thesis, and they are invisible at the syscall level because they happen inside the kernel's VFS/overlayFS layer, not via user-visible syscalls.
+
+How to capture them:
+Kernel ftracepoints for overlayFS: Use kprobe or fentry on ovl_copy_up_one, ovl_create_whiteout, ovl_do_whiteout (kernel-internal functions) instead of/in addition to syscall tracepoints
+upperdir stat polling: Your comment mentions "each container's upperdir stat" — periodically stat(upperdir) and diff the inode count. This is complementary to the tracing approach
+OverlayFS tracepoints: Starting from kernel 5.11+, there are tracepoint/overlayfs/* events you can attach to
+Minor Issues & Recommendations
+#	Issue	Severity	File
+1	
+go.mod
+ says go 1.25.3 — Go versions don't go past 1.24 as of now; this might cause toolchain issues	Low	
+go.mod
+2	securityContext: privileged: true — consider using fine-grained capabilities (CAP_BPF, CAP_SYS_ADMIN, CAP_PERFMON) instead for better security posture	Low	
+ebpf.yaml
+3	The file is named 
+rabc.yaml
+ — likely a typo for rbac.yaml	Cosmetic	
+rabc.yaml
+4	No health/readiness probes in the DaemonSet — Kubernetes can't tell if the tracer is healthy	Low	
+ebpf.yaml
+5	hostPID: true is set but never used — only hostPID is needed for cgroup access; consider removing if not required	Low	
+ebpf.yaml
+6	Commented-out code blocks in 
+main.go
+ (lines 146-161, 331-339) should be cleaned up	Cosmetic	
+main.go
+7	No structured logging (using fmt.Println everywhere) — harder to parse in production	Low	
+main.go
+8	The cgroup_filter map max_entries is 8192 — on a large node with many pods/containers this could be too small	Medium	
+trace.ebpf.c
+Prioritized Action Items
+Listed by importance to your research goals:
+
+🔴 Add overlayFS kernel-level probes (copy-up, whiteout, opaque dir) — these are the core of your research gap
+🔴 Add delete syscall tracing (unlink, unlinkat, rmdir) — essential for net inode tracking
+🔴 Fix event.Type buffer size (8 → 16 bytes) — currently corrupting 
+symlinkat
+/
+mknodat
+ labels
+🟡 Add 
+link
+/
+linkat
+/openat2 tracing — completeness of syscall coverage
+🟡 Verify cgroup ID vs inode mismatch on your target cluster — could cause silent event drops
+🟡 Move K8s clientset creation out of 
+refreshPodMap
+ — performance and correctness
+🟢 Add graceful shutdown — data integrity during rolling updates
+🟢 Address Prometheus cardinality — operational stability
+🟢 Increase ring buffer size — reliability under malicious load scenarios

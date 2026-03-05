@@ -4,8 +4,9 @@
 #include <bpf/bpf_tracing.h>
 
 struct event {
-    char type[8];
+    char type[16];
     u64 cgroup;
+    s32 delta;
 };
 
 struct {
@@ -20,7 +21,7 @@ struct {
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-#define O_CREAT 0x40
+//#define O_CREAT 0x40
 
 #define FILTER_AND_RESERVE \
     u64 cg = bpf_get_current_cgroup_id(); \
@@ -30,73 +31,84 @@ struct {
     if (!e) return 0; \
     e->cgroup = cg;
 
-SEC("tracepoint/syscalls/sys_enter_mkdir")
-int trace_mkdir(struct trace_event_raw_sys_enter *ctx) {
+SEC("fentry/vfs_create")
+int BPF_PROG(trace_vfs_create, struct mnt_idmap *idmap,
+struct inode *dir, struct dentry *dentry, umode_t mode, bool want_excl)
+{
     FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "mkdir");
+    e->delta = 1;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_create");
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_mkdirat")
-int trace_mkdirat(struct trace_event_raw_sys_enter *ctx) {
-    FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "mkdirat");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
+// SEC("tracepoint/syscalls/sys_enter_mkdir")
+// int trace_mkdir(struct trace_event_raw_sys_enter *ctx) {
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "mkdir");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
 
-SEC("tracepoint/syscalls/sys_enter_open")
-int trace_open(struct trace_event_raw_sys_enter *ctx) {
-    u64 flags = BPF_CORE_READ(ctx, args[1]);
-    if (!(flags & O_CREAT)) return 0;
-    FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "open");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
+// SEC("tracepoint/syscalls/sys_enter_mkdirat")
+// int trace_mkdirat(struct trace_event_raw_sys_enter *ctx) {
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "mkdirat");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
 
-SEC("tracepoint/syscalls/sys_enter_openat")
-int trace_openat(struct trace_event_raw_sys_enter *ctx) {
-    u64 flags = BPF_CORE_READ(ctx, args[2]);
-    if (!(flags & O_CREAT)) return 0;
-    FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "openat");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
+// SEC("tracepoint/syscalls/sys_enter_open")
+// int trace_open(struct trace_event_raw_sys_enter *ctx) {
+//     u64 flags = BPF_CORE_READ(ctx, args[1]);
+//     if (!(flags & O_CREAT)) return 0;
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "open");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
 
-SEC("tracepoint/syscalls/sys_enter_mknod")
-int trace_mknod(struct trace_event_raw_sys_enter *ctx) {
-    FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "mknod");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
+// SEC("tracepoint/syscalls/sys_enter_openat")
+// int trace_openat(struct trace_event_raw_sys_enter *ctx) {
+//     u64 flags = BPF_CORE_READ(ctx, args[2]);
+//     if (!(flags & O_CREAT)) return 0;
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "openat");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
 
-SEC("tracepoint/syscalls/sys_enter_mknodat")
-int trace_mknodat(struct trace_event_raw_sys_enter *ctx) {
-    FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "mknodat");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
+// SEC("tracepoint/syscalls/sys_enter_mknod")
+// int trace_mknod(struct trace_event_raw_sys_enter *ctx) {
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "mknod");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
 
-SEC("tracepoint/syscalls/sys_enter_symlink")
-int trace_symlink(struct trace_event_raw_sys_enter *ctx) {
-    FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "symlink");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
+// SEC("tracepoint/syscalls/sys_enter_mknodat")
+// int trace_mknodat(struct trace_event_raw_sys_enter *ctx) {
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "mknodat");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
 
-SEC("tracepoint/syscalls/sys_enter_symlinkat")
-int trace_symlinkat(struct trace_event_raw_sys_enter *ctx) {
-    FILTER_AND_RESERVE
-    bpf_probe_read_str(e->type, sizeof(e->type), "symlinkat");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
+// SEC("tracepoint/syscalls/sys_enter_symlink")
+// int trace_symlink(struct trace_event_raw_sys_enter *ctx) {
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "symlink");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
+
+// SEC("tracepoint/syscalls/sys_enter_symlinkat")
+// int trace_symlinkat(struct trace_event_raw_sys_enter *ctx) {
+//     FILTER_AND_RESERVE
+//     bpf_probe_read_str(e->type, sizeof(e->type), "symlinkat");
+//     bpf_ringbuf_submit(e, 0);
+//     return 0;
+// }
 
 
 char LICENSE[] SEC("license") = "GPL";
