@@ -191,6 +191,13 @@ This Go program acts as the **user-space companion** to the eBPF kernel program,
 - **Manage BPF Maps:** Updates `cgroup_filter` and reads `events` from the eBPF ring buffer.
 - **Pod Mapping:** Maps cgroup IDs to Kubernetes pods by querying the cluster API.
 - **Event Processing:** Reads events from the ring buffer, correlates them with pod information, and prints structured logs.
+```
+Compile Go Lang Code
+
+CGO_CFLAGS="$(pkg-config --cflags libbpf)" \
+CGO_LDFLAGS="$(pkg-config --libs libbpf)" \
+go build -v -o daemon .
+```
 
 ### Sample Index Node Stress Workloads (Only for Testing)
 ```
