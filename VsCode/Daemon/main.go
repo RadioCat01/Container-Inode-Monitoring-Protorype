@@ -43,7 +43,6 @@ var (
 	discoveryInProgress = make(map[string]bool)
 	discoveryMutex      sync.Mutex
 
-	// Gauges: current total/free/used inodes per pod
 	inodeOpTotal    = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name:      "container_inode_operation_total",
@@ -86,7 +85,6 @@ var (
 	)
 	// Runtime maps
 	upperdirMap   = make(map[string]string) // podUID -> upperdir (host path)
-	inodePrevUsed = make(map[string]uint64) // podUID -> last used count (Files - Ffree)
 )
 //////////////////////////////////////////////////////////////
 // Kubernetes Client Initialization (only once)
@@ -211,13 +209,9 @@ func refreshPodMap(ctx context.Context) error {
 
 			// Remove runtime tracking
 			delete(upperdirMap, uid)
-			delete(inodePrevUsed, uid)
 
 			// Remove Prometheus metrics
-			overlayInodeTotal.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
-			overlayInodeFree.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
-			overlayInodeUsed.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
-			overlayInodeUsedDelta.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
+			containerInodeNetDelta.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
 
 			for _, op := range []string{
 				"mkdir", "mkdirat",
@@ -352,7 +346,6 @@ func discoverUpperdirForPod(podUID, podName, namespace string) {
 				// store host path; dedupe
 				upperdirMap[podUID] = upper
 				// initialize prev used to 0 so first sample sets baseline
-				inodePrevUsed[podUID] = 0
 				mapMutex.Unlock()
 				fmt.Printf("Discovered upperdir for pod %s/%s: %s\n", namespace, podName, upper)
 				return
@@ -375,26 +368,22 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// 1. Get Node-Level Global Exhaustion Stats dynamically by using any known upperdir
-			var nodeFsPath = "/"
+		case <-ticker.C:			
+			var nodeFsPath = "/" 
 			mapMutex.RLock()
 			for _, upper := range upperdirMap {
-				nodeFsPath = upper
-				break // Only need one valid path on the container partition
+				nodeFsPath = upper 
+				break 
 			}
 			mapMutex.RUnlock()
-
 			var nodeSt syscall.Statfs_t
 			if err := syscall.Statfs(nodeFsPath, &nodeSt); err == nil {
 				nodeName := os.Getenv("NODE_NAME")
 				if nodeName == "" {
 					nodeName = "unknown"
 				}
-
 				nodeTotal := float64(nodeSt.Files)
 				nodeFree := float64(nodeSt.Ffree)
-
 				nodeInodeTotal.WithLabelValues(nodeName).Set(nodeTotal)
 				nodeInodeFree.WithLabelValues(nodeName).Set(nodeFree)
 			}
@@ -432,9 +421,6 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 					ns = info.Namespace
 				}
 				overlayInodeUsed.WithLabelValues(pn, ns).Set(float64(actualUsed))
-				mapMutex.Lock()
-				inodePrevUsed[p.podUID] = actualUsed
-				mapMutex.Unlock()
 			}
 		}
 	}
