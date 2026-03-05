@@ -59,22 +59,6 @@ var (
 		},
 		[]string{"pod_name", "namespace"},
 	)
-	overlayInodeUsed = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name:      "overlayfs_inode_used",
-			Help:      "Used inode count of overlay upperdir per pod.",
-			Subsystem: "overlayfs_tracer",
-		},
-		[]string{"pod_name", "namespace"},
-	)
-	nodeInodeTotal = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name:      "node_inode_total",
-			Help:      "Total inode capacity of the underlying host filesystem.",
-			Subsystem: "overlayfs_tracer",
-		},
-		[]string{"node_name"},
-	)
 	nodeInodeFree = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name:      "node_inode_free",
@@ -83,12 +67,8 @@ var (
 		},
 		[]string{"node_name"},
 	)
-	// Runtime maps
-	upperdirMap   = make(map[string]string) // podUID -> upperdir (host path)
+	upperdirMap   = make(map[string]string)
 )
-//////////////////////////////////////////////////////////////
-// Kubernetes Client Initialization (only once)
-//////////////////////////////////////////////////////////////
 
 func initKubeClient() error {
 	config, err := rest.InClusterConfig()
@@ -102,10 +82,6 @@ func initKubeClient() error {
 	kubeClient = client
 	return nil
 }
-
-//////////////////////////////////////////////////////////////
-// Cgroup Discovery
-//////////////////////////////////////////////////////////////
 
 func getCgroupInfo(root, prefix string) (map[uint64]string, error) {
 	result := make(map[uint64]string)
@@ -168,10 +144,6 @@ func refreshCgroupMap(bpfMap *libbpfgo.BPFMap, root, prefix string) error {
 	return nil
 }
 
-//////////////////////////////////////////////////////////////
-// Pod Map Refresh
-//////////////////////////////////////////////////////////////
-
 func refreshPodMap(ctx context.Context) error {
 	fmt.Println("Refreshing Pod Map")
 
@@ -198,19 +170,12 @@ func refreshPodMap(ctx context.Context) error {
 	mapMutex.Lock()
 	defer mapMutex.Unlock()
 
-	// 🔹 Keep reference to old map BEFORE replacing
 	oldMap := uidToPodInfo
 
-	// 🔹 Detect deleted pods
 	for uid, oldInfo := range oldMap {
 		if _, stillExists := newMap[uid]; !stillExists {
-
 			fmt.Printf("Pod deleted detected: %s/%s\n", oldInfo.Namespace, oldInfo.Name)
-
-			// Remove runtime tracking
 			delete(upperdirMap, uid)
-
-			// Remove Prometheus metrics
 			containerInodeNetDelta.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
 
 			for _, op := range []string{
@@ -223,16 +188,10 @@ func refreshPodMap(ctx context.Context) error {
 			}
 		}
 	}
-
-	// 🔹 Now replace old map
 	uidToPodInfo = newMap
 
 	return nil
 }
-
-//////////////////////////////////////////////////////////////
-// Utility: Extract Pod UID
-//////////////////////////////////////////////////////////////
 
 func extractPodUID(cgroupPath string) string {
 	parts := strings.Split(strings.TrimPrefix(cgroupPath, "/"), "/")
@@ -258,13 +217,8 @@ func extractPodUID(cgroupPath string) string {
 	return ""
 }
 
-//////////////////////////////////////////////////////////////
-// Utility: Extract Pod PID
-//////////////////////////////////////////////////////////////
-
 func findAnyPidForPod(podUID string) (string, error) {
 	mapMutex.RLock()
-	// snapshot the paths (to avoid holding lock while doing IO)
 	paths := make([]string, 0, len(inoToCgroupPath))
 	for _, p := range inoToCgroupPath {
 		if strings.Contains(p, podUID) {
@@ -281,15 +235,11 @@ func findAnyPidForPod(podUID string) (string, error) {
 		}
 		lines := strings.Fields(strings.TrimSpace(string(data)))
 		if len(lines) > 0 {
-			return lines[0], nil // return first PID
+			return lines[0], nil
 		}
 	}
 	return "", fmt.Errorf("no pid found for podUID %s", podUID)
 }
-
-//////////////////////////////////////////////////////////////
-// Utility: Extract Upperdir for POD PID
-//////////////////////////////////////////////////////////////
 
 func findUpperdirForPid(pid string) (string, error) {
 	miPath := filepath.Join("/proc", pid, "mountinfo")
@@ -302,15 +252,10 @@ func findUpperdirForPid(pid string) (string, error) {
 		if line == "" {
 			continue
 		}
-		// mountinfo format: fields ... - fstype source mountopts ...
-		// We can search the options part for "upperdir="
-		// Simpler: search the whole line for "overlay" and "upperdir="
 		if strings.Contains(line, " overlay ") && strings.Contains(line, "upperdir=") {
-			// options usually after the 6th field; but just extract upperdir=... portion
 			idx := strings.Index(line, "upperdir=")
 			if idx >= 0 {
 				rest := line[idx+len("upperdir="):]
-				// upperdir value ends at comma or space
 				end := strings.IndexAny(rest, ", ")
 				if end == -1 {
 					end = len(rest)
@@ -323,12 +268,7 @@ func findUpperdirForPid(pid string) (string, error) {
 	return "", fmt.Errorf("upperdir not found in mountinfo for pid %s", pid)
 }
 
-//////////////////////////////////////////////////////////////
-// Utility: Extract Upperdir for POD
-//////////////////////////////////////////////////////////////
-
 func discoverUpperdirForPod(podUID, podName, namespace string) {
-	// quickly return if already discovered
 	mapMutex.RLock()
 	_, ok := upperdirMap[podUID]
 	mapMutex.RUnlock()
@@ -336,16 +276,13 @@ func discoverUpperdirForPod(podUID, podName, namespace string) {
 		return
 	}
 
-	// try a few times with small backoff
 	for i := 0; i < 4; i++ {
 		pid, err := findAnyPidForPod(podUID)
 		if err == nil && pid != "" {
 			upper, err := findUpperdirForPid(pid)
 			if err == nil && upper != "" {
 				mapMutex.Lock()
-				// store host path; dedupe
 				upperdirMap[podUID] = upper
-				// initialize prev used to 0 so first sample sets baseline
 				mapMutex.Unlock()
 				fmt.Printf("Discovered upperdir for pod %s/%s: %s\n", namespace, podName, upper)
 				return
@@ -353,13 +290,8 @@ func discoverUpperdirForPod(podUID, podName, namespace string) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	// failed: keep trying next sample (no tight loop)
 	fmt.Printf("Warning: failed to discover upperdir for pod %s\n", podUID)
 }
-
-//////////////////////////////////////////////////////////////
-// Utility: POD Sampling Main Function
-//////////////////////////////////////////////////////////////
 
 func sampleInodes(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -382,13 +314,10 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 				if nodeName == "" {
 					nodeName = "unknown"
 				}
-				nodeTotal := float64(nodeSt.Files)
 				nodeFree := float64(nodeSt.Ffree)
-				nodeInodeTotal.WithLabelValues(nodeName).Set(nodeTotal)
 				nodeInodeFree.WithLabelValues(nodeName).Set(nodeFree)
 			}
 
-			// snapshot keys
 			mapMutex.RLock()
 			pods := make([]struct {
 				podUID   string
@@ -401,55 +330,20 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 				}{podUID, upper})
 			}
 			mapMutex.RUnlock()
-
-			for _, p := range pods {
-				var actualUsed uint64 = 0
-				err := filepath.WalkDir(p.upperdir, func(path string, d os.DirEntry, err error) error {
-					if err == nil { 
-						actualUsed++
-					}
-					return nil 
-				})
-				
-				mapMutex.RLock()
-				info, ok := uidToPodInfo[p.podUID]
-				mapMutex.RUnlock()
-				pn := "unknown"
-				ns := "unknown"
-				if ok {
-					pn = info.Name
-					ns = info.Namespace
-				}
-				overlayInodeUsed.WithLabelValues(pn, ns).Set(float64(actualUsed))
-			}
 		}
 	}
 }
 
-//////////////////////////////////////////////////////////////
-// MAIN
-//////////////////////////////////////////////////////////////
 
 func main() {
-
-	//////////////////////////////////////////////////////////////
-	// Prometheus Server
-	//////////////////////////////////////////////////////////////
-
 	prometheus.MustRegister(inodeOpTotal)
-	prometheus.MustRegister(overlayInodeUsed)
 	prometheus.MustRegister(containerInodeNetDelta)
-	prometheus.MustRegister(nodeInodeTotal)
 	prometheus.MustRegister(nodeInodeFree)
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
 		http.ListenAndServe(":9091", nil)
 	}()
-
-	//////////////////////////////////////////////////////////////
-	// Kubernetes Client
-	//////////////////////////////////////////////////////////////
 
 	if err := initKubeClient(); err != nil {
 		fmt.Println("Kubernetes client init failed:", err)
@@ -458,10 +352,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	//////////////////////////////////////////////////////////////
-	// Locate Cgroup Root
-	//////////////////////////////////////////////////////////////
 
 	candidates := []string{
 		"/sys/fs/cgroup/kubepods.slice",
@@ -484,10 +374,6 @@ func main() {
 
 	prefix := "/" + filepath.Base(root)
 
-	//////////////////////////////////////////////////////////////
-	// Load eBPF
-	//////////////////////////////////////////////////////////////
-
 	module, err := libbpfgo.NewModuleFromFile("trace.bpf.o")
 	if err != nil {
 		panic(err)
@@ -502,10 +388,6 @@ func main() {
 
 	refreshCgroupMap(cgroupMap, root, prefix)
 	refreshPodMap(ctx)
-
-	//////////////////////////////////////////////////////////////
-	// Background Refresh
-	//////////////////////////////////////////////////////////////
 
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
@@ -523,25 +405,6 @@ func main() {
 
 	go sampleInodes(ctx, 15*time.Second)
 
-	//////////////////////////////////////////////////////////////
-	// Attach Tracepoints
-	//////////////////////////////////////////////////////////////
-
-	// tracepoints := []string{
-	// 	"mkdir", "mkdirat",
-	// 	"open", "openat",
-	// 	"mknod", "mknodat",
-	// 	"symlink", "symlinkat",
-	// }
-
-	// for _, tp := range tracepoints {
-	// 	prog, err := module.GetProgram("trace_" + tp)
-	// 	if err != nil {
-	// 		continue
-	// 	}
-	// 	prog.AttachTracepoint("syscalls", "sys_enter_"+tp)
-	// }
-
 	fentryProgs := []string{
 		"trace_vfs_mkdir",
 		"trace_vfs_unlink",
@@ -549,7 +412,7 @@ func main() {
 		"trace_vfs_link",
 		"trace_vfs_symlink",
 		"trace_vfs_create",
-		"trace_vfs_mknod"
+		"trace_vfs_mknod",
 	}
 
 	for _, name := range fentryProgs {
@@ -563,19 +426,13 @@ func main() {
 		}
 	}
 
-	//////////////////////////////////////////////////////////////
-	// Ring Buffer
-	//////////////////////////////////////////////////////////////
-
-	eventsChan := make(chan []byte, 1024)
+	//Ring Buffer
+	eventsChan := make(chan []byte, 1000000)
 	rb, _ := module.InitRingBuf("events", eventsChan)
 	rb.Start()
 	defer rb.Stop()
 
-	//////////////////////////////////////////////////////////////
-	// Graceful Shutdown
-	//////////////////////////////////////////////////////////////
-
+	//Graceful Shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
@@ -586,10 +443,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	//////////////////////////////////////////////////////////////
-	// Event Loop
-	//////////////////////////////////////////////////////////////
-
+	//Event Loop
 	for data := range eventsChan {
 		var e event
 		if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
@@ -654,7 +508,3 @@ func main() {
 	}
 
 }
-
-// CGO_CFLAGS="$(pkg-config --cflags libbpf)" \
-// CGO_LDFLAGS="$(pkg-config --libs libbpf)" \
-// go build -v -o daemon .
