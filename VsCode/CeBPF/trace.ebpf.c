@@ -7,6 +7,7 @@ struct event {
     char type[16];
     u64 cgroup;
     s32 delta;
+    u32 _pad;
 };
 
 struct {

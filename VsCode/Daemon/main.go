@@ -27,6 +27,7 @@ type event struct {
 	Type   [16]byte
 	Cgroup uint64
 	Delta  int32
+	Pad uint32
 }
 
 type PodInfo struct {
@@ -39,6 +40,10 @@ var (
 	inoToCgroupPath = make(map[uint64]string)
 	uidToPodInfo    = make(map[string]PodInfo)
 	kubeClient      *kubernetes.Clientset
+	discoveryInProgress = make(map[string]bool)
+	discoveryMutex      sync.Mutex
+
+	// Gauges: current total/free/used inodes per pod
 	inodeOpTotal    = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name:      "container_inode_operation_total",
@@ -47,32 +52,14 @@ var (
 		},
 		[]string{"operation", "pod_name", "namespace"},
 	)
-)
-
-//////////////////////////////////////////////////////////////
-// Inode Measures
-//////////////////////////////////////////////////////////////
-
-var (
-	// Gauges: current total/free/used inodes per pod
-	overlayInodeTotal = prometheus.NewGaugeVec(
+	containerInodeNetDelta = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name:      "overlayfs_inode_total",
-			Help:      "Total inode count of overlay upperdir per pod.",
+			Name:      "container_inode_net_delta",
+			Help:      "Running net total of inode allocations vs deletions tracked by eBPF per pod.",
 			Subsystem: "overlayfs_tracer",
 		},
 		[]string{"pod_name", "namespace"},
 	)
-
-	overlayInodeFree = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name:      "overlayfs_inode_free",
-			Help:      "Free inode count of overlay upperdir per pod.",
-			Subsystem: "overlayfs_tracer",
-		},
-		[]string{"pod_name", "namespace"},
-	)
-
 	overlayInodeUsed = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name:      "overlayfs_inode_used",
@@ -81,22 +68,26 @@ var (
 		},
 		[]string{"pod_name", "namespace"},
 	)
-
-	// Counter: positive increases in used inodes per sampling (so increase() works)
-	overlayInodeUsedDelta = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name:      "overlayfs_inode_used_delta_total",
-			Help:      "Accumulated positive delta of used inodes detected per pod (sampling-based).",
+	nodeInodeTotal = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:      "node_inode_total",
+			Help:      "Total inode capacity of the underlying host filesystem.",
 			Subsystem: "overlayfs_tracer",
 		},
-		[]string{"pod_name", "namespace"},
+		[]string{"node_name"},
 	)
-
+	nodeInodeFree = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:      "node_inode_free",
+			Help:      "Available inode count on the underlying host filesystem.",
+			Subsystem: "overlayfs_tracer",
+		},
+		[]string{"node_name"},
+	)
 	// Runtime maps
 	upperdirMap   = make(map[string]string) // podUID -> upperdir (host path)
 	inodePrevUsed = make(map[string]uint64) // podUID -> last used count (Files - Ffree)
 )
-
 //////////////////////////////////////////////////////////////
 // Kubernetes Client Initialization (only once)
 //////////////////////////////////////////////////////////////
@@ -385,6 +376,29 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 1. Get Node-Level Global Exhaustion Stats dynamically by using any known upperdir
+			var nodeFsPath = "/"
+			mapMutex.RLock()
+			for _, upper := range upperdirMap {
+				nodeFsPath = upper
+				break // Only need one valid path on the container partition
+			}
+			mapMutex.RUnlock()
+
+			var nodeSt syscall.Statfs_t
+			if err := syscall.Statfs(nodeFsPath, &nodeSt); err == nil {
+				nodeName := os.Getenv("NODE_NAME")
+				if nodeName == "" {
+					nodeName = "unknown"
+				}
+
+				nodeTotal := float64(nodeSt.Files)
+				nodeFree := float64(nodeSt.Ffree)
+
+				nodeInodeTotal.WithLabelValues(nodeName).Set(nodeTotal)
+				nodeInodeFree.WithLabelValues(nodeName).Set(nodeFree)
+			}
+
 			// snapshot keys
 			mapMutex.RLock()
 			pods := make([]struct {
@@ -397,52 +411,29 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 					upperdir string
 				}{podUID, upper})
 			}
-
-			fmt.Println("Current upperdirMap entries:")
-			for uid, upper := range upperdirMap {
-				fmt.Printf("  podUID=%s -> upperdir=%s\n", uid, upper)
-			}
-
 			mapMutex.RUnlock()
 
 			for _, p := range pods {
-				// do the statfs
-
-				var st syscall.Statfs_t
-				err := syscall.Statfs(p.upperdir, &st)
-				if err != nil {
-					continue
-				}
-
-				total := uint64(st.Files)
-				free := uint64(st.Ffree)
-				used := total - free
-
-				// map podUID -> pod name/namespace for labels
+				var actualUsed uint64 = 0
+				err := filepath.WalkDir(p.upperdir, func(path string, d os.DirEntry, err error) error {
+					if err == nil { 
+						actualUsed++
+					}
+					return nil 
+				})
+				
 				mapMutex.RLock()
 				info, ok := uidToPodInfo[p.podUID]
 				mapMutex.RUnlock()
-
 				pn := "unknown"
 				ns := "unknown"
 				if ok {
 					pn = info.Name
 					ns = info.Namespace
 				}
-
-				// update gauges
-				overlayInodeTotal.WithLabelValues(pn, ns).Set(float64(total))
-				overlayInodeFree.WithLabelValues(pn, ns).Set(float64(free))
-				overlayInodeUsed.WithLabelValues(pn, ns).Set(float64(used))
-
-				// compute delta using prev snapshot
+				overlayInodeUsed.WithLabelValues(pn, ns).Set(float64(actualUsed))
 				mapMutex.Lock()
-				prev := inodePrevUsed[p.podUID]
-				if used > prev {
-					delta := used - prev
-					overlayInodeUsedDelta.WithLabelValues(pn, ns).Add(float64(delta))
-				}
-				inodePrevUsed[p.podUID] = used
+				inodePrevUsed[p.podUID] = actualUsed
 				mapMutex.Unlock()
 			}
 		}
@@ -460,10 +451,10 @@ func main() {
 	//////////////////////////////////////////////////////////////
 
 	prometheus.MustRegister(inodeOpTotal)
-	prometheus.MustRegister(overlayInodeTotal)
-	prometheus.MustRegister(overlayInodeFree)
 	prometheus.MustRegister(overlayInodeUsed)
-	prometheus.MustRegister(overlayInodeUsedDelta)
+	prometheus.MustRegister(containerInodeNetDelta)
+	prometheus.MustRegister(nodeInodeTotal)
+	prometheus.MustRegister(nodeInodeFree)
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
@@ -571,6 +562,8 @@ func main() {
 		"trace_vfs_rmdir",
 		"trace_vfs_link",
 		"trace_vfs_symlink",
+		"trace_vfs_create",
+		"trace_vfs_mknod"
 	}
 
 	for _, name := range fentryProgs {
@@ -646,9 +639,19 @@ func main() {
 		mapMutex.RLock()
 		_, exists := upperdirMap[podUID]
 		mapMutex.RUnlock()
+
 		if !exists {
-			// run discovery async; do not block event loop
-			go discoverUpperdirForPod(podUID, podName, namespace)
+			discoveryMutex.Lock()
+			if !discoveryInProgress[podUID] {
+				discoveryInProgress[podUID] = true
+				go func() {
+					discoverUpperdirForPod(podUID, podName, namespace)
+					discoveryMutex.Lock()
+					delete(discoveryInProgress, podUID)
+					discoveryMutex.Unlock()
+				}()
+			}
+			discoveryMutex.Unlock()
 		}
 
 		inodeOpTotal.With(prometheus.Labels{
@@ -656,6 +659,12 @@ func main() {
 			"pod_name":  podName,
 			"namespace": namespace,
 		}).Inc()
+
+		containerInodeNetDelta.With(prometheus.Labels{
+			"pod_name":  podName,
+			"namespace": namespace,
+		}).Add(float64(e.Delta))
+
 	}
 
 }
