@@ -133,8 +133,9 @@ This file implements the kernel-level tracing logic using **eBPF**. The design f
 Captures filesystem events (mkdir, open, symlink, etc.). Type identifies the syscall type, cgroup stores the current cgroup ID.
 ```c
 struct event {
-    char type[8];
+    char type[16];
     u64 cgroup;
+    s32 delta;
 };
 ```
 #### 2. BPF Maps
@@ -148,8 +149,12 @@ struct event {
 
 Maps are declared with SEC(".maps") and loaded by libbpf/libbpfgo in the Go daemon.
 
-#### 3. Tracepoints & Filtering
-- Each function attaches to a specific syscall tracepoint (sys_enter_mkdir, sys_enter_open, etc.)
+#### 3. FTrace & Filtering
+- fentry(ftrace) BPF_PROG (s) are used to do the tracing with minimal overhead.
+  - **sudo bpftrace -lv 'fentry:vfs_create'** used to identify the function arguments for each function
+  - vfs_create, vfs_mkdir, vfs_mknod, vfs_syslink --> delta +1
+  - vfs_unlink, vfs_rmdir --> delta -1
+  - vfs_link --> delta 0
 - Macro FILTER_AND_RESERVE:
   - Reads current cgroup ID (bpf_get_current_cgroup_id())
   - Filters out irrelevant cgroups using cgroup_filter
