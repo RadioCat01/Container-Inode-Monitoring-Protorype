@@ -151,10 +151,33 @@ Maps are declared with SEC(".maps") and loaded by libbpf/libbpfgo in the Go daem
 
 #### 3. FTrace & Filtering
 - fentry(ftrace) BPF_PROG (s) are used to do the tracing with minimal overhead.
-  - **sudo bpftrace -lv 'fentry:vfs_create'** used to identify the function arguments for each function
+  - **sudo bpftrace -lv 'fentry:vfs_func'** used to identify the function arguments for each function
   - vfs_create, vfs_mkdir, vfs_mknod, vfs_syslink --> delta +1
   - vfs_unlink, vfs_rmdir --> delta -1
   - vfs_link --> delta 0
+```
+sudo bpftrace -lv 'fentry:vfs_create'
+kfunc:vmlinux:vfs_create
+    struct mnt_idmap * idmap
+    struct inode * dir
+    struct dentry * dentry
+    umode_t mode
+    bool want_excl
+    int retval
+
+which implemented as, in eBPF C program.
+
+SEC("fentry/vfs_create")
+int BPF_PROG(trace_vfs_create, struct mnt_idmap *idmap,
+struct inode *dir, struct dentry *dentry, umode_t mode, bool want_excl)
+{
+    FILTER_AND_RESERVE
+    e->delta = 1;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_create");
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+```
 - Macro FILTER_AND_RESERVE:
   - Reads current cgroup ID (bpf_get_current_cgroup_id())
   - Filters out irrelevant cgroups using cgroup_filter
