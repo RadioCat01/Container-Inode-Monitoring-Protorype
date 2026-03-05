@@ -32,8 +32,12 @@ struct {
     e->cgroup = cg;
 
 SEC("fentry/vfs_create")
-int BPF_PROG(trace_vfs_create, struct mnt_idmap *idmap,
-struct inode *dir, struct dentry *dentry, umode_t mode, bool want_excl)
+int BPF_PROG(trace_vfs_create, 
+    struct mnt_idmap *idmap,
+    struct inode *dir, 
+    struct dentry *dentry, 
+    umode_t mode, 
+    bool want_excl)
 {
     FILTER_AND_RESERVE
     e->delta = 1;
@@ -42,6 +46,89 @@ struct inode *dir, struct dentry *dentry, umode_t mode, bool want_excl)
     return 0;
 }
 
+SEC("fentry/vfs_mkdir")
+int BPF_PROG(trace_vfs_mkdir, 
+    struct mnt_idmap *idmap,
+    struct inode *dir, 
+    struct dentry *dentry, 
+    umode_t mode)
+{
+    FILTER_AND_RESERVE
+    e->delta = 1;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_mkdir");
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("fentry/vfs_mknod")
+int BPF_PROG(trace_vfs_mknod, 
+    struct mnt_idmap *idmap,
+    struct inode *dir, 
+    struct dentry *dentry, 
+    umode_t mode, 
+    dev_t dev)
+{
+    FILTER_AND_RESERVE
+    e->delta = 1;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_mknod");
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("fentry/vfs_symlink")
+int BPF_PROG(trace_vfs_symlink, 
+    struct mnt_idmap *idmap,
+    struct inode *dir, 
+    struct dentry *dentry, 
+    const char *symname)
+{
+    FILTER_AND_RESERVE
+    e->delta = 1;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_symlink");
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("fentry/vfs_unlink")
+int BPF_PROG(trace_vfs_unlink, 
+    struct mnt_idmap *idmap,
+    struct inode *dir, 
+    struct dentry *dentry)
+{
+    FILTER_AND_RESERVE
+    e->delta = -1;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_unlink");
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("fentry/vfs_rmdir")
+int BPF_PROG(trace_vfs_rmdir, 
+    struct mnt_idmap *idmap,
+    struct inode *dir, 
+    struct dentry *dentry)
+{
+    FILTER_AND_RESERVE
+    e->delta = -1;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_rmdir");
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("fentry/vfs_link")
+int BPF_PROG(trace_vfs_link, 
+    struct mnt_idmap *idmap,
+    struct inode *old_dir, 
+    struct dentry *old_dentry, 
+    struct inode *new_dir, 
+    struct dentry *new_dentry)
+{
+    FILTER_AND_RESERVE
+    e->delta = 0;
+    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_link");
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
 // SEC("tracepoint/syscalls/sys_enter_mkdir")
 // int trace_mkdir(struct trace_event_raw_sys_enter *ctx) {
 //     FILTER_AND_RESERVE
