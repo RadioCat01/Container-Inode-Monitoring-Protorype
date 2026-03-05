@@ -24,8 +24,9 @@ import (
 )
 
 type event struct {
-	Type   [8]byte
+	Type   [16]byte
 	Cgroup uint64
+	Delta  int32
 }
 
 type PodInfo struct {
@@ -549,19 +550,38 @@ func main() {
 	// Attach Tracepoints
 	//////////////////////////////////////////////////////////////
 
-	tracepoints := []string{
-		"mkdir", "mkdirat",
-		"open", "openat",
-		"mknod", "mknodat",
-		"symlink", "symlinkat",
+	// tracepoints := []string{
+	// 	"mkdir", "mkdirat",
+	// 	"open", "openat",
+	// 	"mknod", "mknodat",
+	// 	"symlink", "symlinkat",
+	// }
+
+	// for _, tp := range tracepoints {
+	// 	prog, err := module.GetProgram("trace_" + tp)
+	// 	if err != nil {
+	// 		continue
+	// 	}
+	// 	prog.AttachTracepoint("syscalls", "sys_enter_"+tp)
+	// }
+
+	fentryProgs := []string{
+		"trace_vfs_mkdir",
+		"trace_vfs_unlink",
+		"trace_vfs_rmdir",
+		"trace_vfs_link",
+		"trace_vfs_symlink",
 	}
 
-	for _, tp := range tracepoints {
-		prog, err := module.GetProgram("trace_" + tp)
+	for _, name := range fentryProgs {
+		prog, err := module.GetProgram(name)
 		if err != nil {
-			continue
+			fmt.Printf("failed to get prog %s: %v", name, err)
 		}
-		prog.AttachTracepoint("syscalls", "sys_enter_"+tp)
+
+		if _, err := prog.AttachGeneric(); err != nil {
+			fmt.Printf("failed to attach %s: %v", name, err)
+		}
 	}
 
 	//////////////////////////////////////////////////////////////
