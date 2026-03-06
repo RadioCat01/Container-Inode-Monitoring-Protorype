@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exp2-evasion
+  namespace: default
+spec:
+  containers:
+  - name: alpine
+    image: alpine:latest
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Waiting 20 seconds for eBPF cgroup sync..."
+      sleep 20
+      echo "Starting invisible inode consumption (create/delete loop)..."
+      mkdir -p /tmp/evasion
+      # Create and instantly delete 10,000 files
+      for i in $(seq 1 10000); do
+        touch /tmp/evasion/evil_$i
+        rm /tmp/evasion/evil_$i
+      done
+      echo "Done! Keeping pod alive for metrics collection."
+      sleep 3600
