@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exp4-copyupz
+  namespace: default
+spec:
+  containers:
+  - name: ubuntu
+    image: ubuntu:latest
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Waiting 20 seconds for eBPF cgroup sync..."
+      sleep 30
+      echo "Modifying base image files to trigger OverlayFS copy-ups..."
+      # Modify 50 base files
+      for f in $(ls -1 /etc | grep "\.conf$" | head -n 50); do
+        echo "# modified" >> /etc/$f
+      done
+      echo "Done! Keeping pod alive for metrics collection."
+      sleep 3600

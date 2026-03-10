@@ -43,6 +43,9 @@ var (
 	discoveryInProgress = make(map[string]bool)
 	discoveryMutex      sync.Mutex
 
+	podRefreshMutex   sync.Mutex
+	podRefreshPending bool
+
 	inodeOpTotal    = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name:      "container_inode_operation_total",
@@ -390,14 +393,14 @@ func main() {
 	refreshPodMap(ctx)
 
 	go func() {
-		ticker := time.NewTicker(15 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		for range ticker.C {
 			refreshCgroupMap(cgroupMap, root, prefix)
 		}
 	}()
 
 	go func() {
-		ticker := time.NewTicker(60 * time.Second)
+		ticker := time.NewTicker(10 * time.Second)
 		for range ticker.C {
 			refreshPodMap(ctx)
 		}
@@ -467,6 +470,21 @@ func main() {
 		mapMutex.RLock()
 		info, ok := uidToPodInfo[podUID]
 		mapMutex.RUnlock()
+
+		if !ok {
+			podRefreshMutex.Lock()
+			if !podRefreshPending {
+				podRefreshPending = true
+				go func() {
+					refreshPodMap(ctx)
+					time.Sleep(10 * time.Second) // Rate limit re-scans
+					podRefreshMutex.Lock()
+					podRefreshPending = false
+					podRefreshMutex.Unlock()
+				}()
+			}
+			podRefreshMutex.Unlock()
+		}
 
 		podName := "unknown"
 		namespace := "unknown"
