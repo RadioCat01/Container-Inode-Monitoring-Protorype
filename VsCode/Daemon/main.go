@@ -18,16 +18,18 @@ import (
 	"github.com/aquasecurity/libbpfgo"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
+
 type event struct {
-	Type   [16]byte
-	Cgroup uint64
-	Delta  int32
-	Pad uint32
+	Type   [16]byte 
+	Cgroup uint64   
+	Delta  int32   
+	Pad    uint32  
 }
 
 type PodInfo struct {
@@ -37,16 +39,15 @@ type PodInfo struct {
 
 var (
 	mapMutex        sync.RWMutex
-	inoToCgroupPath = make(map[uint64]string)
-	uidToPodInfo    = make(map[string]PodInfo)
+	inoToCgroupPath = make(map[uint64]string)  
+	uidToPodInfo    = make(map[string]PodInfo) 
 	kubeClient      *kubernetes.Clientset
-	discoveryInProgress = make(map[string]bool)
-	discoveryMutex      sync.Mutex
 
-	podRefreshMutex   sync.Mutex
+	// Rate-limiter for fallback pod refresh
+	podRefreshMu      sync.Mutex
 	podRefreshPending bool
 
-	inodeOpTotal    = prometheus.NewCounterVec(
+	inodeOpTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name:      "container_inode_operation_total",
 			Help:      "Cumulative count of filesystem inode operations by type, pod, and namespace.",
@@ -60,7 +61,7 @@ var (
 			Help:      "Running net total of inode allocations vs deletions tracked by eBPF per pod.",
 			Subsystem: "overlayfs_tracer",
 		},
-		[]string{"pod_name", "namespace"},
+		[]string{"operation", "pod_name", "namespace"},
 	)
 	nodeInodeFree = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -70,9 +71,9 @@ var (
 		},
 		[]string{"node_name"},
 	)
-	upperdirMap   = make(map[string]string)
 )
 
+//Kube Client initialization
 func initKubeClient() error {
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -86,34 +87,7 @@ func initKubeClient() error {
 	return nil
 }
 
-func getCgroupInfo(root, prefix string) (map[uint64]string, error) {
-	result := make(map[uint64]string)
-
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			stat, ok := info.Sys().(*syscall.Stat_t)
-			if ok {
-				rel, _ := filepath.Rel(root, path)
-				fullPath := prefix
-				if rel != "." {
-					fullPath += "/" + rel
-				}
-				result[stat.Ino] = fullPath
-			}
-		}
-		return nil
-	})
-
-	return result, err
-}
-
+// Update Cgroup Map
 func refreshCgroupMap(bpfMap *libbpfgo.BPFMap, root, prefix string) error {
 	newInfo, err := getCgroupInfo(root, prefix)
 	if err != nil {
@@ -147,15 +121,66 @@ func refreshCgroupMap(bpfMap *libbpfgo.BPFMap, root, prefix string) error {
 	return nil
 }
 
-func refreshPodMap(ctx context.Context) error {
-	fmt.Println("Refreshing Pod Map")
+// Map Cgroup Inodes to Paths
+func getCgroupInfo(root, prefix string) (map[uint64]string, error) {
+	result := make(map[uint64]string)
 
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if ok {
+				rel, _ := filepath.Rel(root, path)
+				fullPath := prefix
+				if rel != "." {
+					fullPath += "/" + rel
+				}
+				result[stat.Ino] = fullPath
+			}
+		}
+		return nil
+	})
+
+	return result, err
+}
+
+// Extract Pod UID from Cgroup Path
+func extractPodUID(cgroupPath string) string {
+	parts := strings.Split(strings.TrimPrefix(cgroupPath, "/"), "/")
+
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+
+		if strings.HasPrefix(part, "pod") {
+			uid := strings.TrimPrefix(part, "pod")
+			return strings.ReplaceAll(uid, "_", "-")
+		}
+
+		if strings.HasSuffix(part, ".slice") && strings.Contains(part, "-pod") {
+			tmp := strings.SplitN(part, "-pod", 2)
+			if len(tmp) == 2 {
+				uid := strings.TrimSuffix(tmp[1], ".slice")
+				return strings.ReplaceAll(uid, "_", "-")
+			}
+		}
+	}
+	return ""
+}
+
+// Refresh Pod Map
+func refreshPodMap(ctx context.Context) error {
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
 		return fmt.Errorf("NODE_NAME not set")
 	}
 
-	pods, err := kubeClient.CoreV1().Pods("").List(ctx, v1.ListOptions{
+	pods, err := kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + nodeName,
 	})
 	if err != nil {
@@ -172,130 +197,71 @@ func refreshPodMap(ctx context.Context) error {
 
 	mapMutex.Lock()
 	defer mapMutex.Unlock()
-
-	oldMap := uidToPodInfo
-
-	for uid, oldInfo := range oldMap {
-		if _, stillExists := newMap[uid]; !stillExists {
-			fmt.Printf("Pod deleted detected: %s/%s\n", oldInfo.Namespace, oldInfo.Name)
-			delete(upperdirMap, uid)
-			containerInodeNetDelta.DeleteLabelValues(oldInfo.Name, oldInfo.Namespace)
-
-			for _, op := range []string{
-				"mkdir", "mkdirat",
-				"open", "openat",
-				"mknod", "mknodat",
-				"symlink", "symlinkat",
-			} {
-				inodeOpTotal.DeleteLabelValues(op, oldInfo.Name, oldInfo.Namespace)
-			}
-		}
-	}
 	uidToPodInfo = newMap
-
+	fmt.Printf("Refreshed Pod Map: found %d pods on node %s\n", len(uidToPodInfo), nodeName)
 	return nil
 }
 
-func extractPodUID(cgroupPath string) string {
-	parts := strings.Split(strings.TrimPrefix(cgroupPath, "/"), "/")
-
-	for i := len(parts) - 1; i >= 0; i-- {
-		part := parts[i]
-
-		if strings.HasPrefix(part, "pod") {
-			return strings.TrimPrefix(part, "pod")
-		}
-
-		if strings.HasSuffix(part, ".slice") && strings.Contains(part, "-pod") {
-			tmp := strings.SplitN(part, "-pod", 2)
-			if len(tmp) == 2 {
-				return strings.ReplaceAll(
-					strings.TrimSuffix(tmp[1], ".slice"),
-					"_",
-					"-",
-				)
-			}
-		}
-	}
-	return ""
-}
-
-func findAnyPidForPod(podUID string) (string, error) {
-	mapMutex.RLock()
-	paths := make([]string, 0, len(inoToCgroupPath))
-	for _, p := range inoToCgroupPath {
-		if strings.Contains(p, podUID) {
-			paths = append(paths, p)
-		}
-	}
-	mapMutex.RUnlock()
-
-	for _, p := range paths {
-		procsPath := filepath.Join("/sys/fs/cgroup", p, "cgroup.procs")
-		data, err := os.ReadFile(procsPath)
-		if err != nil {
-			continue
-		}
-		lines := strings.Fields(strings.TrimSpace(string(data)))
-		if len(lines) > 0 {
-			return lines[0], nil
-		}
-	}
-	return "", fmt.Errorf("no pid found for podUID %s", podUID)
-}
-
-func findUpperdirForPid(pid string) (string, error) {
-	miPath := filepath.Join("/proc", pid, "mountinfo")
-	data, err := os.ReadFile(miPath)
-	if err != nil {
-		return "", err
-	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		if strings.Contains(line, " overlay ") && strings.Contains(line, "upperdir=") {
-			idx := strings.Index(line, "upperdir=")
-			if idx >= 0 {
-				rest := line[idx+len("upperdir="):]
-				end := strings.IndexAny(rest, ", ")
-				if end == -1 {
-					end = len(rest)
-				}
-				upper := rest[:end]
-				return upper, nil
-			}
-		}
-	}
-	return "", fmt.Errorf("upperdir not found in mountinfo for pid %s", pid)
-}
-
-func discoverUpperdirForPod(podUID, podName, namespace string) {
-	mapMutex.RLock()
-	_, ok := upperdirMap[podUID]
-	mapMutex.RUnlock()
-	if ok {
+// Watch Pods
+func watchPods(ctx context.Context) {
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		fmt.Println("NODE_NAME not set, watcher disabled")
 		return
 	}
 
-	for i := 0; i < 4; i++ {
-		pid, err := findAnyPidForPod(podUID)
-		if err == nil && pid != "" {
-			upper, err := findUpperdirForPid(pid)
-			if err == nil && upper != "" {
-				mapMutex.Lock()
-				upperdirMap[podUID] = upper
-				mapMutex.Unlock()
-				fmt.Printf("Discovered upperdir for pod %s/%s: %s\n", namespace, podName, upper)
-				return
-			}
+	for {
+		// Initial full list synchronization
+		err := refreshPodMap(ctx)
+		if err != nil {
+			fmt.Printf("Initial pod sync failed: %v, retrying...\n", err)
+			time.Sleep(5 * time.Second)
+			continue
 		}
-		time.Sleep(500 * time.Millisecond)
+
+		watcher, err := kubeClient.CoreV1().Pods("").Watch(ctx, metav1.ListOptions{
+			FieldSelector: "spec.nodeName=" + nodeName,
+		})
+		if err != nil {
+			fmt.Printf("Pod watcher failed: %v, retrying...\n", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		fmt.Printf("Pod watcher started for node %s\n", nodeName)
+		for event := range watcher.ResultChan() {
+			pod, ok := event.Object.(*corev1.Pod)
+			if !ok {
+				continue
+			}
+
+			mapMutex.Lock()
+			uid := string(pod.UID)
+			switch event.Type {
+			case "ADDED", "MODIFIED":
+				uidToPodInfo[uid] = PodInfo{
+					Name:      pod.Name,
+					Namespace: pod.Namespace,
+				}
+			case "DELETED":
+				delete(uidToPodInfo, uid)
+				containerInodeNetDelta.DeleteLabelValues(pod.Name, pod.Namespace)
+				for _, op := range []string{
+					"vfs_create", "vfs_mkdir", "vfs_mknod", "vfs_rename",
+					"vfs_symlink", "vfs_link",
+					"vfs_unlink", "vfs_rmdir",
+				} {
+					inodeOpTotal.DeleteLabelValues(op, pod.Name, pod.Namespace)
+				}
+			}
+			mapMutex.Unlock()
+		}
+		fmt.Println("Pod watcher channel closed, restarting...")
+		time.Sleep(1 * time.Second)
 	}
-	fmt.Printf("Warning: failed to discover upperdir for pod %s\n", podUID)
 }
 
+//Updating node level free inode gauge
 func sampleInodes(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -303,36 +269,15 @@ func sampleInodes(ctx context.Context, interval time.Duration) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:			
-			var nodeFsPath = "/" 
-			mapMutex.RLock()
-			for _, upper := range upperdirMap {
-				nodeFsPath = upper 
-				break 
-			}
-			mapMutex.RUnlock()
+		case <-ticker.C:
 			var nodeSt syscall.Statfs_t
-			if err := syscall.Statfs(nodeFsPath, &nodeSt); err == nil {
+			if err := syscall.Statfs("/", &nodeSt); err == nil {
 				nodeName := os.Getenv("NODE_NAME")
 				if nodeName == "" {
 					nodeName = "unknown"
 				}
-				nodeFree := float64(nodeSt.Ffree)
-				nodeInodeFree.WithLabelValues(nodeName).Set(nodeFree)
+				nodeInodeFree.WithLabelValues(nodeName).Set(float64(nodeSt.Ffree))
 			}
-
-			mapMutex.RLock()
-			pods := make([]struct {
-				podUID   string
-				upperdir string
-			}, 0, len(upperdirMap))
-			for podUID, upper := range upperdirMap {
-				pods = append(pods, struct {
-					podUID   string
-					upperdir string
-				}{podUID, upper})
-			}
-			mapMutex.RUnlock()
 		}
 	}
 }
@@ -374,9 +319,9 @@ func main() {
 		fmt.Println("kubepods path not found")
 		os.Exit(1)
 	}
-
 	prefix := "/" + filepath.Base(root)
 
+	//Loading eBPF object
 	module, err := libbpfgo.NewModuleFromFile("trace.bpf.o")
 	if err != nil {
 		panic(err)
@@ -387,55 +332,59 @@ func main() {
 		panic(err)
 	}
 
-	cgroupMap, _ := module.GetMap("cgroup_filter")
+	cgroupMap, err := module.GetMap("cgroup_filter")
+	if err != nil {
+		fmt.Printf("failed to get cgroup_filter map: %v\n", err)
+		os.Exit(1)
+	}
 
 	refreshCgroupMap(cgroupMap, root, prefix)
-	refreshPodMap(ctx)
 
+	//Routines
+	go watchPods(ctx)
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		for range ticker.C {
 			refreshCgroupMap(cgroupMap, root, prefix)
 		}
 	}()
+	go sampleInodes(ctx, 10*time.Second)
 
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		for range ticker.C {
-			refreshPodMap(ctx)
-		}
-	}()
-
-	go sampleInodes(ctx, 15*time.Second)
-
+	// Attach all fentry probes to kernel VFS functions
 	fentryProgs := []string{
+		"trace_vfs_create",
 		"trace_vfs_mkdir",
+		"trace_vfs_mknod",
+		"trace_vfs_symlink",
+		"trace_vfs_link",
 		"trace_vfs_unlink",
 		"trace_vfs_rmdir",
-		"trace_vfs_link",
-		"trace_vfs_symlink",
-		"trace_vfs_create",
-		"trace_vfs_mknod",
+		"trace_vfs_rename",
 	}
 
 	for _, name := range fentryProgs {
 		prog, err := module.GetProgram(name)
 		if err != nil {
-			fmt.Printf("failed to get prog %s: %v", name, err)
+			fmt.Printf("failed to get prog %s: %v\n", name, err)
+			continue
 		}
 
 		if _, err := prog.AttachGeneric(); err != nil {
-			fmt.Printf("failed to attach %s: %v", name, err)
+			fmt.Printf("failed to attach %s: %v\n", name, err)
 		}
 	}
 
-	//Ring Buffer
+	// Initialize Ring Buffer consumer
 	eventsChan := make(chan []byte, 1000000)
-	rb, _ := module.InitRingBuf("events", eventsChan)
+	rb, err := module.InitRingBuf("events", eventsChan)
+	if err != nil {
+		fmt.Printf("failed to init ring buffer: %v\n", err)
+		os.Exit(1)
+	}
 	rb.Start()
 	defer rb.Stop()
 
-	//Graceful Shutdown
+	// Graceful Shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
@@ -446,7 +395,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	//Event Loop
+
+	// Event Loop
 	for data := range eventsChan {
 		var e event
 		if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
@@ -455,35 +405,40 @@ func main() {
 
 		op := strings.TrimRight(string(e.Type[:]), "\x00")
 
+		// Step 1: Resolve cgroup ID → cgroup path
 		mapMutex.RLock()
 		cgroupPath, ok := inoToCgroupPath[e.Cgroup]
 		mapMutex.RUnlock()
+
 		if !ok {
 			continue
 		}
 
+		// Step 2: Extract Pod UID from cgroup path
 		podUID := extractPodUID(cgroupPath)
 		if podUID == "" {
 			continue
 		}
 
+		// Step 3: Resolve Pod UID → Pod Name/Namespace
 		mapMutex.RLock()
 		info, ok := uidToPodInfo[podUID]
 		mapMutex.RUnlock()
 
 		if !ok {
-			podRefreshMutex.Lock()
+			// Async, rate-limited fallback: refresh pod map without blocking the event loop
+			podRefreshMu.Lock()
 			if !podRefreshPending {
 				podRefreshPending = true
 				go func() {
 					refreshPodMap(ctx)
-					time.Sleep(10 * time.Second) // Rate limit re-scans
-					podRefreshMutex.Lock()
+					time.Sleep(5 * time.Second)
+					podRefreshMu.Lock()
 					podRefreshPending = false
-					podRefreshMutex.Unlock()
+					podRefreshMu.Unlock()
 				}()
 			}
-			podRefreshMutex.Unlock()
+			podRefreshMu.Unlock()
 		}
 
 		podName := "unknown"
@@ -494,24 +449,7 @@ func main() {
 			namespace = info.Namespace
 		}
 
-		mapMutex.RLock()
-		_, exists := upperdirMap[podUID]
-		mapMutex.RUnlock()
-
-		if !exists {
-			discoveryMutex.Lock()
-			if !discoveryInProgress[podUID] {
-				discoveryInProgress[podUID] = true
-				go func() {
-					discoverUpperdirForPod(podUID, podName, namespace)
-					discoveryMutex.Lock()
-					delete(discoveryInProgress, podUID)
-					discoveryMutex.Unlock()
-				}()
-			}
-			discoveryMutex.Unlock()
-		}
-
+		// Record Prometheus metrics
 		inodeOpTotal.With(prometheus.Labels{
 			"operation": op,
 			"pod_name":  podName,
@@ -519,10 +457,9 @@ func main() {
 		}).Inc()
 
 		containerInodeNetDelta.With(prometheus.Labels{
+			"operation": op,
 			"pod_name":  podName,
 			"namespace": namespace,
 		}).Add(float64(e.Delta))
-
 	}
-
 }

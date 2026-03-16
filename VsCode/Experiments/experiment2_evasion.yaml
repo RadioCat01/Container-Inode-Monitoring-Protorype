@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: exp2-evasion
+  name: exp2-evasion-test
   namespace: default
 spec:
   containers:
@@ -10,11 +10,12 @@ spec:
     command: ["/bin/sh", "-c"]
     args:
     - |
-      echo "Waiting 20 seconds for eBPF cgroup sync..."
-      sleep 20
-      echo "Starting invisible inode consumption (create/delete loop)..."
+      echo "Waking up cgroup discovery..."
+      touch /tmp/warmup
+      echo "Waiting 60s for kernel whitelisting..." 
+      sleep 60
+      echo "Running Evasion research payload (instant create/delete)..."
       mkdir -p /tmp/evasion
-      # Create and instantly delete 10,000 files
       for i in $(seq 1 10000); do
         touch /tmp/evasion/evil_$i
         rm /tmp/evasion/evil_$i
