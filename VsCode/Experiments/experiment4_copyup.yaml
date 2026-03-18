@@ -15,7 +15,11 @@ spec:
       # Wait generously for the 5-15s refreshCgroupMap ticker to hit
       echo "Waiting 60s for kernel whitelisting..." 
       sleep 60
-      echo "Running actual research payload..."
-      for f in $(ls -1 /etc | grep "\.conf$" | head -n 50); do
-        echo "# modified" >> /etc/$f
+      echo "Running New Path Copy-Up Payload..."
+      mkdir -p /root/testdir
+            echo "Running Atomic Append Copy-Up Payload..."
+      for f in $(ls -1 /etc/*.conf | head -n 500); do
+        # Appending to an existing lowerdir file triggers the 
+        # workdir optimization (creating hidden temp file, then vfs_link)
+        echo "# modified" >> $f
       done
