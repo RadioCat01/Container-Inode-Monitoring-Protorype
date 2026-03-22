@@ -350,7 +350,7 @@ func main() {
 	}()
 	go sampleInodes(ctx, 10*time.Second)
 
-	// Attach all fentry probes to kernel VFS functions
+	// Attach fentry probes to kernel VFS functions
 	fentryProgs := []string{
 		"trace_vfs_create",
 		"trace_vfs_mkdir",
@@ -373,6 +373,40 @@ func main() {
 			fmt.Printf("failed to attach %s: %v\n", name, err)
 		}
 	}
+
+	//
+	kprobeProgs := map[string][]string{
+		"trace_ovl_unlink":  {"ovl_unlink", "ovl_do_unlink", "ovl_remove"},
+		"trace_ovl_cleanup_and_whiteout": {"ovl_cleanup_and_whiteout"},
+		"trace_ovl_copy_up":  {"ovl_copy_up_flags", "ovl_copy_up_one", "ovl_copy_up_start"},
+	
+	}
+
+	for progName, funcs := range kprobeProgs {
+	prog, err := module.GetProgram(progName)
+	if err != nil {
+		fmt.Printf("failed to get kprobe %s: %v\n", progName, err)
+		continue
+	}
+
+	attached := false
+	for _, fn := range funcs {
+		link, err := prog.AttachKprobe(fn)
+		if err == nil {
+			fmt.Printf("Attached %s -> %s\n", progName, fn)
+			_ = link
+			attached = true
+			break
+		} else {
+			fmt.Printf("Failed %s -> %s: %v\n", progName, fn, err)
+		}
+	}
+
+	if !attached {
+		fmt.Printf("Could not attach any symbol for %s\n", progName)
+	}
+	}
+
 
 	// Initialize Ring Buffer consumer
 	eventsChan := make(chan []byte, 1000000)

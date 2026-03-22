@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: whiteout-test-pod
+spec:
+  restartPolicy: Never
+  containers:
+  - name: whiteout-container
+    image: radiocat2000/whiteoutalphine:v1
+    imagePullPolicy: Always
+
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        echo "Container started. Waiting 60s...";
+        sleep 60;
+        echo "Starting deletion...";
+        for i in $(seq 1 10000); do
+          rm file_$i
+          sleep 0.01
+        done
+        echo "Deletion done. Sleeping for observation...";
+        sleep 300;
+
+    securityContext:
+      privileged: true

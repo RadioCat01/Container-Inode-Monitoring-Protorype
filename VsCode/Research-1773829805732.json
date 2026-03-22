@@ -234,7 +234,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (pod_name, operation) (overlayfs_tracer_container_inode_net_delta) != 0",
+          "expr": "sum by (pod_name, operation) (overlayfs_tracer_container_inode_net_delta{pod_name=~\"$pod_name\"}) != 0",
           "legendFormat": "{{operation}} : {{pod_name}}",
           "range": true,
           "refId": "A"
@@ -328,7 +328,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (pod_name, operation) (irate(overlayfs_tracer_container_inode_operation_total[5m]))",
+          "expr": "sum by (pod_name, operation) (irate(overlayfs_tracer_container_inode_operation_total{pod_name=~\"$pod_name\"}[5m]))",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -382,6 +382,9 @@
             }
           },
           "mappings": [],
+          "min": 0,
+          "max": null,
+          "unit": "none",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -422,8 +425,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (pod_name) (irate(overlayfs_tracer_container_inode_operation_total[5m]))\n/\n(sum by (pod_name) (irate(overlayfs_tracer_container_inode_operation_total{operation=\"vfs_create\"}[5m])) + 0.001)",
-          "legendFormat": "{{label_name}}",
+          "expr": "sum by (pod_name) (irate(overlayfs_tracer_container_inode_operation_total{pod_name=~\"$pod_name\"}[5m]))\n/\n(sum by (pod_name) (irate(overlayfs_tracer_container_inode_operation_total{operation=\"vfs_create\", pod_name=~\"$pod_name\"}[5m])) + 0.001)",
+          "legendFormat": "{{pod_name}}",
           "range": true,
           "refId": "A"
         }
@@ -500,6 +503,10 @@
               {
                 "id": "unit",
                 "value": "none"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
               },
               {
                 "id": "custom.axisLabel",
@@ -590,11 +597,12 @@
             },
             "showPoints": "auto",
             "showValues": false,
-            "spanNulls": false,
+            "spawnNulls": false,
             "stacking": {
               "group": "A",
               "mode": "none"
             },
+            "fillOpacity": 15,
             "thresholdsStyle": {
               "mode": "off"
             }
@@ -672,9 +680,9 @@
         {
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum by (pod_name, operation) (irate(overlayfs_tracer_container_inode_operation_total{operation=~\"vfs_unlink\"}[5m]))",
+          "expr": "sum by (pod_name, operation) (irate(overlayfs_tracer_container_inode_operation_total{operation=~\"vfs_unlink\", pod_name=~\"$pod_name\"}[5m]))",
           "instant": false,
-          "legendFormat": "{{label_name}}",
+          "legendFormat": "{{pod_name}} Logical Deletions",
           "range": true,
           "refId": "A"
         },
@@ -685,11 +693,11 @@
           },
           "editorMode": "code",
           "exemplar": false,
-          "expr": "sum by (pod_name, operation) (irate(overlayfs_tracer_container_inode_operation_total{operation=~\"vfs_mknod|vfs_link\"}[5m]))",
+          "expr": "sum by (pod_name, operation) (irate(overlayfs_tracer_container_inode_operation_total{operation=~\"vfs_mknod|vfs_link\", pod_name=~\"$pod_name\"}[5m]))",
           "hide": false,
           "instant": false,
           "interval": "",
-          "legendFormat": "__auto",
+          "legendFormat": "{{pod_name}} Physical Whiteouts",
           "range": true,
           "refId": "B"
         }
@@ -703,7 +711,39 @@
   "schemaVersion": 42,
   "tags": [],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "bf7l4alzl8lj4f"
+        },
+        "definition": "label_values(overlayfs_tracer_container_inode_operation_total, pod_name)",
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "name": "pod_name",
+        "options": [],
+        "query": {
+          "query": "label_values(overlayfs_tracer_container_inode_operation_total, pod_name)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
   },
   "time": {
     "from": "now-5m",

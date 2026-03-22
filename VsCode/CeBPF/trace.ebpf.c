@@ -142,4 +142,46 @@ int BPF_PROG(trace_vfs_rename,
     return 0;
 }
 
+SEC("kprobe/ovl_unlink")
+int BPF_KPROBE(trace_ovl_unlink)
+{
+    FILTER_AND_RESERVE
+
+    e->delta = -1;
+
+    const char type[] = "ovl_unlink";
+    __builtin_memcpy(e->type, type, sizeof(type));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/ovl_copy_up")
+int BPF_KPROBE(trace_ovl_copy_up)
+{
+    FILTER_AND_RESERVE
+
+    e->delta = 1;
+
+    const char type[] = "ovl_copy_up";
+    __builtin_memcpy(e->type, type, sizeof(type));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/ovl_cleanup_and_whiteout")
+int BPF_KPROBE(trace_ovl_cleanup_and_whiteout)
+{
+    FILTER_AND_RESERVE
+
+    e->delta = 1; // treat as a creation event
+
+    const char type[] = "ovl_cleanup_and_whiteout";
+    __builtin_memcpy(e->type, type, sizeof(type));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";
