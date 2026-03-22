@@ -22,8 +22,6 @@ struct {
     __uint(max_entries, 4096 * 1024);
 } events SEC(".maps");
 
-//#define O_CREAT 0x40
-
 #define FILTER_AND_RESERVE \
     u64 cg = bpf_get_current_cgroup_id(); \
     u32 *val = bpf_map_lookup_elem(&cgroup_filter, &cg); \
@@ -57,21 +55,6 @@ int BPF_PROG(trace_vfs_mkdir,
     FILTER_AND_RESERVE
     e->delta = 1;
     bpf_probe_read_str(e->type, sizeof(e->type), "vfs_mkdir");
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
-
-SEC("fentry/vfs_mknod")
-int BPF_PROG(trace_vfs_mknod, 
-    struct mnt_idmap *idmap,
-    struct inode *dir, 
-    struct dentry *dentry, 
-    umode_t mode, 
-    dev_t dev)
-{
-    FILTER_AND_RESERVE
-    e->delta = 1;
-    bpf_probe_read_str(e->type, sizeof(e->type), "vfs_mknod");
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
@@ -160,24 +143,8 @@ SEC("kprobe/ovl_copy_up")
 int BPF_KPROBE(trace_ovl_copy_up)
 {
     FILTER_AND_RESERVE
-
     e->delta = 1;
-
     const char type[] = "ovl_copy_up";
-    __builtin_memcpy(e->type, type, sizeof(type));
-
-    bpf_ringbuf_submit(e, 0);
-    return 0;
-}
-
-SEC("kprobe/ovl_cleanup_and_whiteout")
-int BPF_KPROBE(trace_ovl_cleanup_and_whiteout)
-{
-    FILTER_AND_RESERVE
-
-    e->delta = 1; // treat as a creation event
-
-    const char type[] = "ovl_cleanup_and_whiteout";
     __builtin_memcpy(e->type, type, sizeof(type));
 
     bpf_ringbuf_submit(e, 0);

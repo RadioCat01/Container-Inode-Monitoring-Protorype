@@ -354,7 +354,6 @@ func main() {
 	fentryProgs := []string{
 		"trace_vfs_create",
 		"trace_vfs_mkdir",
-		"trace_vfs_mknod",
 		"trace_vfs_symlink",
 		"trace_vfs_link",
 		"trace_vfs_unlink",
@@ -377,9 +376,7 @@ func main() {
 	//
 	kprobeProgs := map[string][]string{
 		"trace_ovl_unlink":  {"ovl_unlink", "ovl_do_unlink", "ovl_remove"},
-		"trace_ovl_cleanup_and_whiteout": {"ovl_cleanup_and_whiteout"},
 		"trace_ovl_copy_up":  {"ovl_copy_up_flags", "ovl_copy_up_one", "ovl_copy_up_start"},
-	
 	}
 
 	for progName, funcs := range kprobeProgs {
