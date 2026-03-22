@@ -194,9 +194,7 @@ This Go program acts as the **user-space companion** to the eBPF kernel program,
 ```
 Compile Go Lang Code
 
-CGO_CFLAGS="$(pkg-config --cflags libbpf)" \
-CGO_LDFLAGS="$(pkg-config --libs libbpf)" \
-go build -v -o daemon .
+CGO_CFLAGS="$(pkg-config --cflags libbpf)" CGO_LDFLAGS="$(pkg-config --libs libbpf)" go build -v -o daemon .
 ```
 
 ### Sample Index Node Stress Workloads (Only for Testing)
