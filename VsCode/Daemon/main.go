@@ -350,7 +350,7 @@ func main() {
 	}()
 	go sampleInodes(ctx, 10*time.Second)
 
-	// Attach fentry probes to kernel VFS functions
+	// Attach fentry probes
 	fentryProgs := []string{
 		"trace_vfs_create",
 		"trace_vfs_mkdir",
@@ -373,10 +373,13 @@ func main() {
 		}
 	}
 
-	//
+	//Attach kernal probes
 	kprobeProgs := map[string][]string{
-		"trace_ovl_unlink":  {"ovl_unlink", "ovl_do_unlink", "ovl_remove"},
-		"trace_ovl_copy_up":  {"ovl_copy_up_flags", "ovl_copy_up_one", "ovl_copy_up_start"},
+		"trace_vfs_mknod":    {"vfs_mknod"},
+		"trace_ovl_unlink":   {"ovl_unlink", "ovl_do_unlink", "ovl_remove"},
+		"trace_ovl_copy_up":  {"ovl_copy_up_one", "ovl_copy_up_start"},
+		"trace_ovl_whiteout": {"ovl_cleanup_and_whiteout"},
+		"trace_ovl_lookup": {"ovl_lookup"},
 	}
 
 	for progName, funcs := range kprobeProgs {

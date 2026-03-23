@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: evasion-test-pod
+spec:
+  restartPolicy: Never
+  containers:
+  - name: evasion-container
+    image: ubuntu:latest
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/bash", "-c"]
+    args:
+      - |
+        echo "Pod started. Preparing environment...";
+        sleep 30;
+
+        # Ensure working directory exists
+        mkdir -p /test_data
+        cd /test_data
+        echo "Starting evasion / ghost inode workload...";
+
+        # Tight loop: create → write → delete
+        for i in $(seq 1 10000); do
+          echo "x" > ghost_$i
+          rm ghost_$i
+        done
+
+        echo "Workload phase 1 complete (sequential).";
+
+        # Burst mode (faster, higher stress)
+        for i in $(seq 1 10000); do
+          fname="ghost_$(date +%s%N)_$i"
+          echo "x" > "$fname"
+          rm "$fname"
+        done
+
+        echo "Workload phase 2 complete (burst/randomized).";
+
+        echo "Sleeping for observation...";
+        sleep 300
+
+    securityContext:
+      privileged: true

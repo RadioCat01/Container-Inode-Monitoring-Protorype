@@ -125,6 +125,17 @@ int BPF_PROG(trace_vfs_rename,
     return 0;
 }
 
+SEC("kprobe/vfs_mknod")
+int BPF_KPROBE(trace_vfs_mknod)
+{
+    FILTER_AND_RESERVE
+    e->delta = 1;
+    const char type[] = "vfs_mknod";
+    __builtin_memcpy(e->type, type, sizeof(type));
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 SEC("kprobe/ovl_unlink")
 int BPF_KPROBE(trace_ovl_unlink)
 {
@@ -150,5 +161,28 @@ int BPF_KPROBE(trace_ovl_copy_up)
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
+
+SEC("kprobe/ovl_cleanup_and_whiteout")
+int BPF_KPROBE(trace_ovl_whiteout)
+{
+    FILTER_AND_RESERVE
+    e->delta = 0;
+    const char type[] = "ovl_whiteout";
+    __builtin_memcpy(e->type, type, sizeof(type));
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("kprobe/ovl_lookup")
+int BPF_KPROBE(trace_ovl_lookup)
+{
+    FILTER_AND_RESERVE
+    e->delta = 0;
+    const char type[] = "ovl_lookup";
+    __builtin_memcpy(e->type, type, sizeof(type));
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 
 char LICENSE[] SEC("license") = "GPL";

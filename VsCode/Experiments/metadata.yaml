@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metaamp-test-pod
+spec:
+  restartPolicy: Never
+  containers:
+  - name: metaamp-container
+    image: radiocat2000/whiteoutalphine:v1
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        echo "Pod started. Waiting 30s for monitoring setup...";
+        sleep 30;
+
+        echo "Simulating metadata amplification...";
+
+        # Append to all files → triggers copy-up in OverlayFS
+        for i in $(seq 1 1000); do
+          echo "y" >> /test_data/file_$i
+          sleep 0.01
+        done
+
+        # Delete some files → triggers unlink and metadata ops
+        for i in $(seq 501 1000); do
+          rm /test_data/file_$i
+          sleep 0.01
+        done
+
+        # Create new files → triggers metadata creation
+        for i in $(seq 1001 2000); do
+          echo "z" > /test_data/file_$i
+          sleep 0.01
+        done
+
+        echo "Simulation done. Sleeping for observation...";
+        sleep 300
+
+    securityContext:
+      privileged: true

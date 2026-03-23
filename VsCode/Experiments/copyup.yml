@@ -13,7 +13,7 @@ spec:
     args:
       - |
         echo "Container started. Waiting 60s...";
-        sleep 60;
+        sleep 30;
 
         echo "Starting copy-up workload (modifications)...";
 

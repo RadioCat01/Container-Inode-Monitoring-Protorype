@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-layer-copyup-test-pod
+spec:
+  restartPolicy: Never
+  containers:
+  - name: deep-copyup-container
+    image: radiocat2000/highlayerimage:v1
+    imagePullPolicy: Always
+
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        echo "Container started. Waiting 30s...";
+        sleep 30;
+
+        cd /test_data
+        echo "Starting COPY-UP workload...";
+
+        for i in $(seq 1 1000); do
+          echo "y" >> file_$i
+          sleep 0.005
+        done
+
+        echo "Copy-up workload done. Sleeping...";
+        sleep 300;
+
+    securityContext:
+      privileged: true
