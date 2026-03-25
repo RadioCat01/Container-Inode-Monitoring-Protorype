@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 1,
+  "id": 0,
   "links": [],
   "panels": [
     {
@@ -35,7 +35,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "OP per second",
+            "axisLabel": "Operations per Second",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "barWidthFactor": 0.6,
@@ -106,13 +106,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (pod_name, operation) (\n  increase(overlayfs_tracer_container_inode_operation_total{pod_name=~\"$pod_name\"}[30s])\n)\n# sum by (pod_name) (\n#   increase(overlayfs_tracer_container_inode_operation_total{operation=\"vfs_link\", pod_name=~\"$pod_name\"}[5m])\n# )",
+          "expr": "sum by (pod_name, operation) (\n  irate(overlayfs_tracer_container_inode_operation_total{\n    operation=~\"vfs_.*\", pod_name=~\"$pod_name\"\n  }[5m])\n)",
           "legendFormat": "{{pod_name}} : {{operation}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Live VFS Operations by Pod",
+      "title": "Physical VFS Operations by Pod",
       "type": "timeseries"
     },
     {
@@ -223,100 +223,6 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 8
-      },
-      "id": 7,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "12.3.0",
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "sum by (pod_name) (\n  increase(overlayfs_tracer_container_inode_operation_total{operation=\"ovl_lookup\", pod_name=~\"$pod_name\"}[5m])\n)",
-          "legendFormat": "{{pod_name}} : ovl_lookup",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Deep Layer",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "bf7l4alzl8lj4f"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
             "axisLabel": "Operation Count",
             "axisPlacement": "auto",
             "barAlignment": 0,
@@ -379,7 +285,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
+        "x": 0,
         "y": 8
       },
       "id": 4,
@@ -404,7 +310,7 @@
             "uid": "bf7l4alzl8lj4f"
           },
           "editorMode": "code",
-          "expr": "sum by (pod_name) (\n  increase(overlayfs_tracer_container_inode_operation_total{operation=\"ovl_copy_up\", pod_name=~\"$pod_name\"}[5m])\n)",
+          "expr": "sum by (pod_name) (\n  irate(overlayfs_tracer_container_inode_operation_total{operation=\"ovl_copy_up\", pod_name=~\"$pod_name\"}[5m])\n)",
           "hide": false,
           "instant": false,
           "legendFormat": "{{pod_name}} : ovl_copy_up",
@@ -417,7 +323,7 @@
             "uid": "bf7l4alzl8lj4f"
           },
           "editorMode": "code",
-          "expr": "sum by (pod_name) (\n  increase(overlayfs_tracer_container_inode_operation_total{operation=\"ovl_whiteout\", pod_name=~\"$pod_name\"}[5m])\n)",
+          "expr": "sum by (pod_name) (\n  irate(overlayfs_tracer_container_inode_operation_total{operation=\"ovl_whiteout\", pod_name=~\"$pod_name\"}[5m])\n)",
           "hide": false,
           "instant": false,
           "legendFormat": "{{pod_name}} : ovl_whiteout",
@@ -426,6 +332,228 @@
         }
       ],
       "title": "Copyup & Whiteout Behavior",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bf7l4alzl8lj4f"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Operations per Second",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (pod_name, operation) (\n  irate(overlayfs_tracer_container_inode_operation_total{\n    operation=~\"ovl_.*\", pod_name=~\"$pod_name\"\n  }[5m])\n)\n",
+          "legendFormat": "{{pod_name}} : {{operation}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Live Semantic Behavior",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "bf7l4alzl8lj4f"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Free Inode Count",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Aggregate Pod Activity"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Aggregated Pod Activity Rate"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bf7l4alzl8lj4f"
+          },
+          "editorMode": "code",
+          "expr": "overlayfs_tracer_node_inode_free",
+          "legendFormat": "Free Inodes On Disk",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "bf7l4alzl8lj4f"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(overlayfs_tracer_container_inode_operation_total[5m]))",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Aggregate Pod Activity",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Node Health Overview",
       "type": "timeseries"
     },
     {
@@ -513,7 +641,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 16
       },
       "id": 3,
@@ -622,8 +750,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 16
+        "x": 0,
+        "y": 24
       },
       "id": 5,
       "options": {
@@ -643,7 +771,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (pod_name) (\n  rate(overlayfs_tracer_container_inode_operation_total{pod_name=~\"$pod_name\", operation=~\"vfs_create|vfs_mkdir|vfs_mknod|vfs_symlink|ovl_copy_up\"}[5m])\n)\n/\n(\n  sum by (pod_name) (\n    rate(overlayfs_tracer_container_inode_operation_total{operation=\"vfs_create\", pod_name=~\"$pod_name\"}[5m])\n  ) + 0.001\n)",
+          "expr": "sum by (pod_name) (\n  increase(overlayfs_tracer_container_inode_operation_total{operation=~\"vfs_.*\", pod_name=~\"$pod_name\"}[5m])\n)\n/\nsum by (pod_name) (\n  increase(overlayfs_tracer_container_inode_operation_total{operation=~\"ovl_unlink|ovl_copy_up\", pod_name=~\"$pod_name\"}[5m])\n)\n",
           "legendFormat": "{{pod_name}}",
           "range": true,
           "refId": "A"
@@ -666,7 +794,7 @@
             "axisBorderShow": false,
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Free Inode Count",
+            "axisLabel": "Operations per Second",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "barWidthFactor": 0.6,
@@ -679,7 +807,7 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "smooth",
+            "lineInterpolation": "linear",
             "lineWidth": 2,
             "pointSize": 1,
             "scaleDistribution": {
@@ -711,73 +839,39 @@
             ]
           }
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Aggregate Pod Activity"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "none"
-              },
-              {
-                "id": "custom.axisLabel",
-                "value": "Aggregated Pod Activity Rate"
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 24
       },
-      "id": 1,
+      "id": 7,
       "options": {
         "legend": {
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": true
+          "showLegend": false
         },
         "tooltip": {
           "hideZeros": false,
-          "mode": "multi",
+          "mode": "single",
           "sort": "none"
         }
       },
       "pluginVersion": "12.3.0",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "bf7l4alzl8lj4f"
-          },
           "editorMode": "code",
-          "expr": "overlayfs_tracer_node_inode_free",
-          "legendFormat": "Free Inodes On Disk",
+          "expr": "sum by (pod_name) (\n  irate(overlayfs_tracer_container_inode_operation_total{operation=\"ovl_lookup\", pod_name=~\"$pod_name\"}[5m])\n)",
+          "legendFormat": "{{pod_name}} : ovl_lookup",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "bf7l4alzl8lj4f"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(overlayfs_tracer_container_inode_operation_total[5m]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Aggregate Pod Activity",
-          "range": true,
-          "refId": "B"
         }
       ],
-      "title": "Node Health Overview",
+      "title": "Deep Layer",
       "type": "timeseries"
     }
   ],
@@ -791,12 +885,12 @@
         "allValue": ".*",
         "current": {
           "text": [
-            "multi-layer-whiteout-test-pod",
-            "whiteout-test-pod"
+            "whiteout-test-pod",
+            "copyup-test-pod"
           ],
           "value": [
-            "multi-layer-whiteout-test-pod",
-            "whiteout-test-pod"
+            "whiteout-test-pod",
+            "copyup-test-pod"
           ]
         },
         "datasource": {
@@ -820,12 +914,12 @@
     ]
   },
   "time": {
-    "from": "now-30m",
+    "from": "now-15m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
   "title": "Research",
   "uid": "adxzm4z",
-  "version": 131
+  "version": 142
 }
