@@ -12,12 +12,12 @@ spec:
     command: ["/bin/sh", "-c"]
     args:
       - |
-        echo "Container started. Waiting 60s...";
+        echo "Container started. Waiting 30s...";
         sleep 30;
 
         echo "Starting copy-up workload (modifications)...";
 
-        for i in $(seq 1 10000); do
+        for i in $(seq 1 1000); do
           echo "y" >> file_$i   # append → forces copy-up
           sleep 0.01
         done

@@ -20,7 +20,7 @@ spec:
         echo "Starting evasion / ghost inode workload...";
 
         # Tight loop: create → write → delete
-        for i in $(seq 1 10000); do
+        for i in $(seq 1 1000); do
           echo "x" > ghost_$i
           rm ghost_$i
         done
@@ -28,7 +28,7 @@ spec:
         echo "Workload phase 1 complete (sequential).";
 
         # Burst mode (faster, higher stress)
-        for i in $(seq 1 10000); do
+        for i in $(seq 1 1000); do
           fname="ghost_$(date +%s%N)_$i"
           echo "x" > "$fname"
           rm "$fname"
