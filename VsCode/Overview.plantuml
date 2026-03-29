@@ -1,0 +1,68 @@
+@startuml
+!theme plain
+autonumber
+
+skinparam ParticipantPadding 30
+skinparam BoxPadding 15
+skinparam sequenceArrowThickness 1.2
+skinparam roundcorner 10
+
+box "User Space (Go Daemon)" #F9F9F9
+participant "Event Loop\n(eventsChan)" as GoMain
+participant "K8s Watcher" as GoWatcher
+participant "CGroup Mapper" as GoMapper
+participant "Prometheus\nMetrics" as Prom
+end box
+
+box "Kernel Space" #EFEFEF
+participant "eBPF Probes" as eBPF
+participant "BPF Maps\n(filter + ringbuf)" as BPFMaps
+participant "Filesystem\n(VFS / OverlayFS)" as Kernel
+end box
+
+box "Container" #FFFFFF
+participant "Pod Application" as PodApp
+end box
+
+== Initialization Phase ==
+GoMain -> BPFMaps: Load eBPF + Initialize Maps
+GoMain -> GoMapper: Build cgroup inode → path map
+GoMapper -> BPFMaps: Populate cgroup_filter
+GoMain -> GoWatcher: Start Pod Watcher
+GoWatcher -> GoMain: Build Pod metadata cache
+GoMain -> Kernel: Attach probes (fentry, kprobes)
+GoMain -> BPFMaps: Bind ring buffer → eventsChan
+
+== Runtime Event Flow (Example: mkdir) ==
+PodApp -> Kernel: Syscall (mkdir)
+Kernel -> eBPF: Trigger probe (vfs_mkdir)
+
+eBPF -> BPFMaps: Check cgroup_filter
+alt Not monitored
+    BPFMaps --> eBPF: No match
+    eBPF --> Kernel: Ignore event
+else Monitored
+    BPFMaps --> eBPF: Match found
+    eBPF -> BPFMaps: Reserve ringbuf event
+    eBPF -> eBPF: Fill event (type, cgroup, delta)
+    eBPF -> BPFMaps: Submit event
+    eBPF --> Kernel: Continue syscall
+end
+
+Kernel --> PodApp: Return result
+
+== Userspace Processing ==
+BPFMaps -->> GoMain: Event via ring buffer
+
+GoMain -> GoMain: Decode event struct
+GoMain -> GoMapper: cgroup → path
+GoMapper --> GoMain: Return path
+
+GoMain -> GoMain: Extract Pod UID
+GoMain -> GoWatcher: UID → Pod info
+GoWatcher --> GoMain: Pod name + namespace
+
+GoMain -> Prom: Update metrics
+Prom --> GoMain: Done
+
+@enduml
