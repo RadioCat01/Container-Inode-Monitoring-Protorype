@@ -28,6 +28,8 @@ The Go daemon uses CGO to dynamically link against libbpf. So that the image mus
 CGO_CFLAGS="$(pkg-config --cflags libbpf)"
 CGO_LDFLAGS="$(pkg-config --libs libbpf)"
 go build -v -o daemon .
+
+CGO_CFLAGS="$(pkg-config --cflags libbpf)" CGO_LDFLAGS="$(pkg-config --libs libbpf)" go build -v -o daemon .
 ```
 * CGO_CFLAGS → instructs Go compiler where libbpf headers are located
 * CGO_LDFLAGS → links the Go binary with the system’s libbpf.so
