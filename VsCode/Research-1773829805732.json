@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 0,
+  "id": 1,
   "links": [],
   "panels": [
     {
@@ -884,13 +884,9 @@
       {
         "allValue": ".*",
         "current": {
-          "text": [
-            "whiteout-test-pod",
-            "copyup-test-pod"
-          ],
+          "text": "All",
           "value": [
-            "whiteout-test-pod",
-            "copyup-test-pod"
+            "$__all"
           ]
         },
         "datasource": {

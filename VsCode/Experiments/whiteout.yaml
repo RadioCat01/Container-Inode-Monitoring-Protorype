@@ -6,19 +6,22 @@ spec:
   restartPolicy: Never
   containers:
   - name: whiteout-container
-    image: radiocat2000/whiteoutalphine:v1
+    image: radiocat2000/whiteoutalphine:v2
     imagePullPolicy: Always
 
     command: ["/bin/sh", "-c"]
     args:
       - |
-        echo "Container started. Waiting 60s...";
+        echo "Container started. Waiting 30s...";
         sleep 30;
+
+        cd /
         echo "Starting deletion...";
-        for i in $(seq 1 1000); do
-          rm file_$i
-          sleep 0.01
+        for i in $(seq 1 10000); do
+        rm file_$i
+        sleep 0.01
         done
+
         echo "Deletion done. Sleeping for observation...";
         sleep 300;
 

@@ -6,7 +6,7 @@ spec:
   restartPolicy: Never
   containers:
   - name: deep-copyup-container
-    image: radiocat2000/highlayerimage:v1
+    image: radiocat2000/multilayer:v1
     imagePullPolicy: Always
 
     command: ["/bin/sh", "-c"]
@@ -15,10 +15,10 @@ spec:
         echo "Container started. Waiting 30s...";
         sleep 30;
 
-        cd /test_data
+        cd /test_data/deep
         echo "Starting COPY-UP workload...";
 
-        for i in $(seq 1 1000); do
+        for i in $(seq 1 10000); do
           echo "y" >> file_$i
           sleep 0.005
         done

@@ -1,0 +1,304 @@
+\documentclass[conference]{IEEEtran}
+
+% ---- Packages ----
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{balance}
+
+% ---- Title ----
+\title{Dual-Layer eBPF Tracing for Per-Pod OverlayFS Inode Monitoring in Kubernetes}
+
+% Double-blind: NO author block
+% \author{...} % Add only for camera-ready
+
+\begin{document}
+\maketitle
+
+% ============================================================
+% SECTION I: INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:introduction}
+
+Modern container orchestration platforms, most notably Kubernetes, depend on union filesystems such as OverlayFS to manage container images and runtime storage efficiently~\cite{watada2019emerging, tarasov2017ideal}. OverlayFS achieves this by stacking a writable \emph{upper} layer over one or more read-only \emph{lower} image layers, transparently intercepting file operations at the kernel level. Two mechanisms central to this design, \emph{copy-up} and \emph{whiteout}, introduce hidden metadata operations that significantly affect inode allocation on the host node. When a container modifies an existing lower-layer file, the kernel copies the entire file into the upper layer before applying the write (copy-up), consuming an additional inode. When a container deletes a lower-layer file, OverlayFS cannot remove it from the read-only layer; instead, it creates a character-device marker (whiteout) in the upper layer to mask the entry~\cite{sun2020baoverlay}.
+
+As container density increases, tracking inode consumption per workload becomes critical. Inode exhaustion on a node leads to \texttt{NoSpaceLeft} errors, pod scheduling failures, and cascading cluster instability~\cite{awad2023survey}. However, contemporary Kubernetes monitoring tools lack the granularity to attribute inode pressure to individual pods at the OverlayFS semantic level. Container-integrated solutions such as cAdvisor provide per-container byte-level I/O counters but cannot distinguish a benign upper-layer write from an expensive copy-up duplication~\cite{inagaki2016container}. Host-level tools such as Prometheus Node Exporter report aggregate free-inode counts without any per-pod attribution. Even advanced eBPF-based security tracers such as Aqua Tracee and Sysdig Falco observe only the VFS system-call boundary and are structurally blind to internal OverlayFS maneuvers such as whiteout marker creation.
+
+This paper presents a proof-of-concept per-pod inode monitoring framework for OverlayFS-based Kubernetes runtimes using extended Berkeley Packet Filter (eBPF). The key contributions are:
+
+\begin{enumerate}
+    \item A \textbf{dual-layer eBPF probe architecture} that simultaneously traces both VFS-level physical operations (\texttt{vfs\_create}, \texttt{vfs\_unlink}, etc.) and OverlayFS-level semantic operations (\texttt{ovl\_copy\_up}, \texttt{ovl\_whiteout}, \texttt{ovl\_lookup}), providing per-pod filesystem attribution via cgroup-based filtering.
+    
+    \item \textbf{Empirical quantification of metadata amplification}: whiteout (deletion) operations exhibit a consistent 3:1 metadata amplification factor, producing three physical VFS operations per semantic deletion, while copy-up operations maintain a 1:1 ratio, independent of image layer depth.
+    
+    \item A \textbf{comparative evaluation} against four industry-standard tools (cAdvisor, Node Exporter, Aqua Tracee, and Sysdig Falco), demonstrating that the proposed framework is the only evaluated tool capable of exposing the complete causal chain from pod-level action through OverlayFS semantics to host-level inode impact.
+\end{enumerate}
+
+The remainder of this paper is organized as follows: Section~\ref{sec:related} reviews related work. Section~\ref{sec:design} describes the system architecture. Section~\ref{sec:methodology} details the experimental methodology. Section~\ref{sec:results} presents the results and analysis. Section~\ref{sec:conclusion} concludes the paper.
+
+
+% ============================================================
+% SECTION II: RELATED WORK (placeholder — user needs to fill)
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+% TODO: Write Related Work section. Cover:
+% - Container monitoring: cAdvisor, Node Exporter (limitations)
+% - eBPF-based observability: Tracee, Falco, Cilium Hubble
+% - OverlayFS internals and container storage studies
+% - Identify the gap: no per-pod OverlayFS semantic inode tracking
+
+
+% ============================================================
+% SECTION III: SYSTEM DESIGN
+% ============================================================
+\section{System Design}
+\label{sec:design}
+
+The proposed framework consists of two cooperating components: a kernel-resident eBPF tracing module written in C and a user-space aggregation daemon written in Go. The framework is deployed as a privileged DaemonSet on each Kubernetes worker node. Fig.~\ref{fig:architecture} illustrates the end-to-end architecture.
+
+% ----- Architecture Figure -----
+\begin{figure}[t]
+    \centering
+    % Replace with actual architecture diagram
+    \fbox{\parbox{0.95\columnwidth}{\centering\vspace{2em}
+    \textbf{[Architecture Diagram Placeholder]}\\[0.5em]
+    \small Kernel Space: fentry probes (VFS) + kprobes (OverlayFS)\\
+    $\downarrow$ BPF Ring Buffer $\downarrow$\\
+    User Space: Go Daemon (cgroup$\to$pod resolution)\\
+    $\downarrow$ HTTP /metrics $\downarrow$\\
+    Prometheus $\to$ Grafana
+    \vspace{2em}}}
+    \caption{End-to-end framework architecture. eBPF probes in kernel space capture VFS and OverlayFS events, filtered by cgroup. Events are streamed via a lock-free ring buffer to the user-space Go daemon, which resolves cgroup IDs to Kubernetes pod identities and exports metrics to Prometheus.}
+    \label{fig:architecture}
+\end{figure}
+
+
+\subsection{Dual-Layer eBPF Probe Architecture}
+\label{subsec:probes}
+
+The eBPF module attaches probes at two distinct kernel layers to capture both physical inode allocations and overlay-specific semantic operations.
+
+\subsubsection{VFS Layer (fentry Probes)}
+Function-entry (\texttt{fentry}) probes are attached to core Virtual File System routines using BPF Type Format (BTF) metadata. The \texttt{fentry} mechanism patches the first instruction of the target function to redirect execution into the eBPF handler with near-zero overhead (no \texttt{int3} interrupt or stack-frame copying), receiving fully typed function arguments. Table~\ref{tab:vfs_probes} lists the traced VFS functions and their inode impact.
+
+\begin{table}[t]
+\centering
+\caption{VFS-layer probes attached via \texttt{fentry}.}
+\label{tab:vfs_probes}
+\small
+\begin{tabular}{@{}llcl@{}}
+\toprule
+\textbf{Kernel Function} & \textbf{Probe} & \textbf{$\Delta$ Inode} & \textbf{Purpose} \\
+\midrule
+\texttt{vfs\_create}  & fentry & $+1$ & File creation \\
+\texttt{vfs\_mkdir}   & fentry & $+1$ & Directory creation \\
+\texttt{vfs\_symlink}  & fentry & $+1$ & Symlink creation \\
+\texttt{vfs\_unlink}  & fentry & $-1$ & File deletion \\
+\texttt{vfs\_rmdir}   & fentry & $-1$ & Directory removal \\
+\texttt{vfs\_rename}  & fentry & $0$  & Rename (no new inode) \\
+\texttt{vfs\_link}    & fentry & $0$  & Hard link (no new inode) \\
+\texttt{vfs\_mknod}   & kprobe & $+1$ & Device node creation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{OverlayFS Layer (kprobes)}
+Kernel probes (\texttt{kprobes}) are bound to internal OverlayFS routines, which are not always BTF-annotated and whose symbol names may vary across kernel versions. The daemon iterates through a candidate symbol list per probe and attaches to the first resolved match, ensuring cross-version compatibility. Table~\ref{tab:ovl_probes} lists the traced OverlayFS functions.
+
+\begin{table}[t]
+\centering
+\caption{OverlayFS-layer probes attached via \texttt{kprobe}.}
+\label{tab:ovl_probes}
+\small
+\begin{tabular}{@{}lcl@{}}
+\toprule
+\textbf{Kernel Function(s)} & \textbf{$\Delta$ Inode} & \textbf{Purpose} \\
+\midrule
+\texttt{ovl\_copy\_up\_one} / & \multirow{2}{*}{$+1$} & Copy-up: lower to \\
+\texttt{ovl\_copy\_up\_start} & & upper layer \\
+\midrule
+\texttt{ovl\_unlink} / & \multirow{2}{*}{$-1$} & OverlayFS-level \\
+\texttt{ovl\_do\_unlink} / \texttt{ovl\_remove} & & file deletion \\
+\midrule
+\texttt{ovl\_cleanup\_and\_whiteout} & $0$ & Whiteout marker creation \\
+\texttt{ovl\_lookup} & $0$ & Layer traversal resolution \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Cgroup-Based Event Filtering}
+\label{subsec:filtering}
+
+Every probe begins execution with a two-stage filtering sequence. First, the BPF helper \texttt{bpf\_get\_current\_cgroup\_id()} retrieves the cgroup~v2 identifier of the process triggering the syscall. This identifier is looked up in a BPF hash map (\texttt{cgroup\_filter}) that serves as a whitelist of monitored container cgroups, populated and periodically refreshed by the user-space daemon. If the calling process does not belong to a monitored pod, the probe returns immediately with negligible overhead. Second, if the cgroup is whitelisted, a slot is reserved in a lock-free BPF ring buffer (4\,MB capacity). The probe then populates a fixed-size event structure comprising the operation type identifier, the cgroup ID, and an inode-delta value ($+1$, $-1$, or $0$) before asynchronously submitting the event to user space. The ring buffer was chosen over the legacy \texttt{PERF\_EVENT\_ARRAY} for its superior memory efficiency and absence of per-CPU buffer fragmentation.
+
+
+\subsection{User-Space Daemon and Metric Export}
+\label{subsec:daemon}
+
+The Go-based daemon executes four principal functions:
+
+\textbf{(1)~eBPF Lifecycle Management.} The daemon loads the pre-compiled eBPF object into the kernel, validates it via the kernel verifier, and attaches all probes. For \texttt{fentry} probes, BTF-based binding is used; for \texttt{kprobes}, the daemon tests multiple candidate symbol names per function to ensure compatibility across kernel versions.
+
+\textbf{(2)~Cgroup-to-Pod Resolution.} Two concurrent mapping tables translate raw kernel cgroup IDs into Kubernetes metadata. A \emph{cgroup inode map} is populated by periodically walking \texttt{/sys/fs/cgroup/kubepods.slice} and extracting the filesystem inode number of each cgroup directory (identical to the cgroup IDs reported in kernel space). A \emph{pod identity map} is maintained via a persistent Kubernetes API watch stream, mapping each pod's UID to its display name and namespace. Synchronization occurs on a 5-second interval, with a fallback full API re-query for newly scheduled pods.
+
+\textbf{(3)~Event Consumption Pipeline.} Events from the BPF ring buffer are consumed into a high-capacity Go channel (1\,M elements). Each event undergoes binary decoding, cgroup path resolution, pod UID extraction, and pod metadata association, producing a fully attributed event record.
+
+\textbf{(4)~Prometheus Metric Exportation.} Three metrics are exported via an HTTP endpoint, as summarized in Table~\ref{tab:metrics}. Upon pod deletion, associated label sets are cleaned up to prevent stale time series.
+
+\begin{table}[t]
+\centering
+\caption{Prometheus metrics exported by the framework.}
+\label{tab:metrics}
+\small
+\begin{tabular}{@{}p{3.8cm}cl@{}}
+\toprule
+\textbf{Metric} & \textbf{Type} & \textbf{Purpose} \\
+\midrule
+\texttt{container\_inode\_}\newline\texttt{operation\_total} & Counter & Per-pod, per-op cumulative count \\
+\midrule
+\texttt{container\_inode\_}\newline\texttt{net\_delta} & Gauge & Running net inode $\Delta$ per pod \\
+\midrule
+\texttt{node\_inode\_free} & Gauge & Host free-inode count \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ============================================================
+% SECTION IV: EXPERIMENTAL METHODOLOGY
+% ============================================================
+\section{Experimental Methodology}
+\label{sec:methodology}
+
+\subsection{Cluster Environment}
+\label{subsec:cluster}
+
+The framework was deployed on a single-node MicroK8s cluster (v1.28) provisioned inside a KVM-based virtual machine running Ubuntu 22.04 with kernel 5.15 and BTF support enabled. This isolated environment ensures reproducible baselines free from external workload interference.
+
+\subsection{Custom Container Images}
+\label{subsec:images}
+
+Two purpose-built images provide deterministic lower-layer content for the experiments:
+
+\begin{itemize}
+    \item \textbf{Shallow-stack image} (\texttt{whiteoutalphine:v1}): Built on Alpine~3.19 with a single \texttt{RUN} layer that pre-seeds 1,000 files into \texttt{/test\_data}, producing a $\sim$2-layer OverlayFS stack.
+    \item \textbf{Deep-stack image} (\texttt{multilayerimage:v1}): Built on Alpine~3.19 with $\sim$155 individual \texttt{RUN} instructions (each creating one file in a separate Dockerfile layer), plus 1,000 operational files seeded at layer~100. This produces a deeply stacked OverlayFS union mount designed to stress \texttt{ovl\_lookup} traversal.
+\end{itemize}
+
+\subsection{Synthetic Workloads}
+\label{subsec:workloads}
+
+Six workloads were deployed as Kubernetes pod manifests, each isolating a specific OverlayFS behavior. Table~\ref{tab:workloads} summarizes the workload specifications. All workloads incorporate a 30-second startup delay (to ensure probe attachment) and a 300-second trailing observation window.
+
+\begin{table}[t]
+\centering
+\caption{Synthetic workload specifications.}
+\label{tab:workloads}
+\small
+\begin{tabular}{@{}p{2.2cm}p{2.8cm}r@{}}
+\toprule
+\textbf{Workload} & \textbf{Target Behavior} & \textbf{Ops} \\
+\midrule
+Shallow copy-up & \texttt{ovl\_copy\_up} (2 layers) & 10k \\
+Shallow whiteout & \texttt{ovl\_whiteout} (2 layers) & 10k \\
+Deep copy-up & \texttt{ovl\_copy\_up} + \texttt{ovl\_lookup} (155 layers) & 10k \\
+Deep whiteout & \texttt{ovl\_whiteout} + \texttt{ovl\_lookup} (155 layers) & 10k \\
+Mixed (metaamp) & Combined copy-up, delete, create & 2.5k \\
+Evasion (churn) & Transient create/delete pairs & 2k \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The workloads are organized into comparative pairs: (i)~shallow vs.\ deep copy-up and whiteout, isolating the effect of layer depth on \texttt{ovl\_lookup} frequency; (ii)~mixed amplification, measuring compounding metadata cost across operation types; and (iii)~transient churn, testing observability of short-lived ``ghost'' inodes invisible to interval-based polling.
+
+\subsection{Comparison Tools}
+\label{subsec:comparison}
+
+To validate the observability gap, four industry-standard tools were deployed on the same node under identical workload conditions:
+
+\begin{itemize}
+    \item \textbf{cAdvisor} (Kubelet-integrated): per-container byte-level I/O counters; baseline for current container-level observability.
+    \item \textbf{Prometheus Node Exporter} (v1.10.2): host-level inode and disk metrics; represents conventional node monitoring.
+    \item \textbf{Aqua Tracee} (v0.24.1): eBPF-based syscall tracer; evaluates VFS-level event capture without OverlayFS semantics.
+    \item \textbf{Sysdig Falco} (v0.43.0): rule-based runtime security tool; assesses syscall-level detection capabilities and per-pod attribution.
+\end{itemize}
+
+All tools operated concurrently during execution of the mixed-amplification workload (\texttt{metaamp-test-pod}) to ensure environmental parity.
+
+\subsection{Evaluation Criteria}
+\label{subsec:criteria}
+
+Each tool is evaluated across five capabilities: (1)~detection of OverlayFS copy-up and whiteout events, (2)~per-pod VFS operation breakdown, (3)~per-pod inode net-delta tracking, (4)~semantic layer visibility (distinguishing overlay operations from raw VFS calls), and (5)~pod-level attribution of inode consumption.
+
+% ============================================================
+% SECTION V: RESULTS AND ANALYSIS (placeholder for next phase)
+% ============================================================
+\section{Results and Analysis}
+\label{sec:results}
+
+% TODO: Write Results & Analysis section covering:
+% V-A. Metadata Amplification (3:1 whiteout, 1:1 copy-up, shallow vs deep)
+% V-B. Dual-Layer Tracing Efficacy (mixed workload phase decomposition, evasion)
+% V-C. Comparative Evaluation (table comparing all 5 tools)
+% V-D. Performance Overhead (<1% CPU, 3-10 MB memory)
+
+% ============================================================
+% SECTION VI: CONCLUSION
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+% TODO: Write conclusion
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{00}
+
+\bibitem{watada2019emerging}
+J.~Watada, A.~Roy, R.~Kadikar, H.~Pham, and B.~Xu,
+``Emerging trends, techniques and open issues of containerization: A review,''
+\emph{IEEE Access}, vol.~7, pp.~152443--152472, 2019.
+
+\bibitem{awad2023survey}
+M.~Awad, A.~Nkusi, A.~Hammad, M.~Almutairi, and M.~Sanaei,
+``A survey of Kubernetes scheduling algorithms,''
+\emph{J. Cloud Comput.}, vol.~12, no.~1, 2023.
+
+\bibitem{inagaki2016container}
+T.~Inagaki, Y.~Ueda, and M.~Ohara,
+``Container management as emerging workload for operating systems,''
+in \emph{Proc. IEEE IISWC}, 2016, pp.~1--10.
+
+\bibitem{sun2020baoverlay}
+Y.~Sun, J.~Lei, S.~Shin, and H.~Lu,
+``Baoverlay: A block-accessible overlay file system for fast and efficient container storage,''
+in \emph{Proc. ACM SoCC}, 2020, pp.~124--137.
+
+\bibitem{tarasov2017ideal}
+V.~Tarasov, L.~Rupprecht, D.~Skourtis, W.~Li, R.~Rangaswami, and M.~Zhao,
+``In search of the ideal storage configuration for Docker containers,''
+in \emph{Proc. IEEE FAS-W}, 2017, pp.~199--206.
+
+% TODO: Add 10-15 more references covering:
+% - eBPF technology (Vieira et al. 2020, Gregg 2019)
+% - Kubernetes monitoring / observability
+% - OverlayFS kernel documentation
+% - cAdvisor / Prometheus documentation
+% - Cilium / Hubble / BCC tools
+% - Container security monitoring (Tracee, Falco papers)
+
+\end{thebibliography}
+
+\end{document}

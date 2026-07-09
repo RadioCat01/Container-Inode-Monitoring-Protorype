@@ -4,7 +4,7 @@ WORKDIR /test_data
 
 RUN apk add --no-cache bash
 
-RUN mkdir -p /test_data && \
+RUN cd / && \
     bash -c '\
     for i in $(seq 1 100); do \
         for j in $(seq 1 100); do \

@@ -17,7 +17,7 @@ spec:
 
         echo "Starting copy-up workload (modifications)...";
 
-        for i in $(seq 1 1000); do
+        for i in $(seq 1 10000); do
           echo "y" >> file_$i   # append → forces copy-up
           sleep 0.01
         done
