@@ -10,6 +10,17 @@ struct event {
     u32 _pad;
 };
 
+struct cgroup_mkdir_event {
+    u64 cgroup_id;
+    u8  event_type;
+    char path[256];
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 64 * 1024);
+} cgroup_events SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 8192);
@@ -180,6 +191,41 @@ int BPF_KPROBE(trace_ovl_lookup)
     e->delta = 0;
     const char type[] = "ovl_lookup";
     __builtin_memcpy(e->type, type, sizeof(type));
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/cgroup/cgroup_mkdir")
+int trace_cgroup_mkdir(struct trace_event_raw_cgroup *ctx) {
+    struct cgroup_mkdir_event *e;
+    e = bpf_ringbuf_reserve(&cgroup_events, sizeof(*e), 0);
+    if (!e) return 0;
+
+    e->cgroup_id = ctx->id;
+    e->event_type = 0; // mkdir
+
+    u32 loc = ctx->__data_loc_path;
+    void *path_ptr = (void *)ctx + (loc & 0xFFFF);
+    bpf_probe_read_str(&e->path, sizeof(e->path), path_ptr);
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/cgroup/cgroup_rmdir")
+int trace_cgroup_rmdir(struct trace_event_raw_cgroup *ctx) {
+    struct cgroup_mkdir_event *e;
+    e = bpf_ringbuf_reserve(&cgroup_events, sizeof(*e), 0);
+    if (!e) return 0;
+
+    e->cgroup_id = ctx->id;
+    e->event_type = 1; // rmdir
+
+    // path not strictly needed for deletion, but cheap to include for logging
+    u32 loc = ctx->__data_loc_path;
+    void *path_ptr = (void *)ctx + (loc & 0xFFFF);
+    bpf_probe_read_str(&e->path, sizeof(e->path), path_ptr);
+
     bpf_ringbuf_submit(e, 0);
     return 0;
 }

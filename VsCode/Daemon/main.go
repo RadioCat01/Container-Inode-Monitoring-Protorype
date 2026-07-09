@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+	"log"
 
 	"github.com/aquasecurity/libbpfgo"
 	"github.com/prometheus/client_golang/prometheus"
@@ -36,6 +37,13 @@ type PodInfo struct {
 	Name      string
 	Namespace string
 }
+
+type CgroupMkdirEvent struct {
+    CgroupID  uint64
+    EventType uint8
+    Path      [256]byte
+}
+
 
 var (
 	mapMutex        sync.RWMutex
@@ -120,6 +128,63 @@ func refreshCgroupMap(bpfMap *libbpfgo.BPFMap, root, prefix string) error {
 	inoToCgroupPath = newInfo
 	return nil
 }
+
+func watchCgroups(ctx context.Context, cgroupMap *libbpfgo.BPFMap, module *libbpfgo.Module) {
+    eventsChan := make(chan []byte, 100)
+    rb, err := module.InitRingBuf("cgroup_events", eventsChan)
+    if err != nil {
+        log.Fatalf("failed to init cgroup ring buffer: %v", err)
+    }
+    rb.Start()
+    defer rb.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case data := <-eventsChan:
+            var e CgroupMkdirEvent
+            if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
+                continue
+            }
+
+            pathStr := strings.TrimRight(string(e.Path[:]), "\x00")
+
+            switch e.EventType {
+            case 0: // mkdir
+                if !strings.Contains(pathStr, "kubepods") {
+                    continue
+                }
+
+                mapMutex.Lock()
+                inoToCgroupPath[e.CgroupID] = pathStr
+                mapMutex.Unlock()
+
+                dummy := uint32(1)
+                if err := cgroupMap.Update(unsafe.Pointer(&e.CgroupID), unsafe.Pointer(&dummy)); err != nil {
+                    fmt.Printf("failed to update cgroup_filter for id %d: %v\n", e.CgroupID, err)
+                }
+
+            case 1: // rmdir
+                mapMutex.Lock()
+                _, existed := inoToCgroupPath[e.CgroupID]
+                delete(inoToCgroupPath, e.CgroupID)
+                mapMutex.Unlock()
+
+                if existed {
+                    if err := cgroupMap.DeleteKey(unsafe.Pointer(&e.CgroupID)); err != nil {
+                        fmt.Printf("failed to delete cgroup_filter for id %d: %v\n", e.CgroupID, err)
+                    }
+                }
+
+            default:
+                // Unknown event_type — defensive guard against future struct changes
+                fmt.Printf("unknown cgroup event_type %d for id %d\n", e.EventType, e.CgroupID)
+            }
+        }
+    }
+}
+
 
 // Map Cgroup Inodes to Paths
 func getCgroupInfo(root, prefix string) (map[uint64]string, error) {
@@ -244,15 +309,15 @@ func watchPods(ctx context.Context) {
 					Namespace: pod.Namespace,
 				}
 			case "DELETED":
-				delete(uidToPodInfo, uid)
-				containerInodeNetDelta.DeleteLabelValues(pod.Name, pod.Namespace)
-				for _, op := range []string{
-					"vfs_create", "vfs_mkdir", "vfs_mknod", "vfs_rename",
-					"vfs_symlink", "vfs_link",
-					"vfs_unlink", "vfs_rmdir",
-				} {
-					inodeOpTotal.DeleteLabelValues(op, pod.Name, pod.Namespace)
-				}
+    delete(uidToPodInfo, uid)
+    for _, op := range []string{
+        "vfs_create", "vfs_mkdir", "vfs_mknod", "vfs_rename",
+        "vfs_symlink", "vfs_link",
+        "vfs_unlink", "vfs_rmdir",
+    } {
+        containerInodeNetDelta.DeleteLabelValues(op, pod.Name, pod.Namespace)
+        inodeOpTotal.DeleteLabelValues(op, pod.Name, pod.Namespace)
+    }
 			}
 			mapMutex.Unlock()
 		}
@@ -340,10 +405,24 @@ func main() {
 
 	refreshCgroupMap(cgroupMap, root, prefix)
 
+	//New ###############################
+	for _, name := range []string{"trace_cgroup_mkdir", "trace_cgroup_rmdir"} {
+    	prog, err := module.GetProgram(name)
+    	if err != nil {
+        	fmt.Printf("failed to get %s: %v\n", name, err)
+        	os.Exit(1)
+    	}
+    	if _, err := prog.AttachGeneric(); err != nil {
+        	fmt.Printf("failed to attach %s: %v\n", name, err)
+        	os.Exit(1)
+    	}
+	}
+	go watchCgroups(ctx, cgroupMap, module)
+
 	//Routines
 	go watchPods(ctx)
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(30 * time.Second)
 		for range ticker.C {
 			refreshCgroupMap(cgroupMap, root, prefix)
 		}
